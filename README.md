@@ -1,5 +1,7 @@
 # diaggulp
 
+> Part of the **[cellular `diag*` toolkit](https://github.com/lukejenkins/cellular#the-diag-toolkit)** — start there for how the capture/decode pieces fit together.
+
 Low-CPU, host-side **Qualcomm DIAG capture**. diaggulp arms the DIAG log
 mask and streams the raw HDLC bytes the modem emits straight to a file or
 stdout — over USB serial, TCP, or UDP — with minimal host CPU.
