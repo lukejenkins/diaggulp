@@ -1,0 +1,45 @@
+[project]
+name = "diaggulp"
+version = "0.1.0"
+description = "Low-CPU host-side Qualcomm DIAG capture — arms the log mask and pumps raw HDLC"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+# Hard, import-time dependency: the DIAG transport core (DiagClient + DGE1
+# helpers), imported at module scope (diaggulp.py:108 `from diagmunge import …`).
+# Inward-only edge: diaggulp -> diagmunge -> diaggrok. Never the reverse.
+# Pinned to the public git remote: diagmunge is not on PyPI yet, so a bare name
+# would not resolve. Repoint to `diagmunge>=X.Y` once it is published.
+dependencies = ["diagmunge @ git+https://github.com/lukejenkins/diagmunge"]
+
+[project.optional-dependencies]
+# diaggulp's own serial reader imports pyserial lazily (diaggulp.py:1641) — only
+# the live serial-capture path needs it; TCP/UDP/raw-fd capture is stdlib-only.
+# pyserial IS on PyPI, so it stays a bare name.
+serial = ["pyserial"]
+# Inline `--decode` imports diaggrok lazily (diaggulp.py:1256-1257). Bare
+# `pip install diaggulp` gives capture with zero diaggrok on the wheel;
+# `pip install diaggulp[decode]` wires the published decoder. (#N locked.)
+# git-pinned for the same reason as diagmunge — diaggrok is public but not yet
+# on PyPI. Repoint to `diaggrok>=X.Y` once it is published.
+decode = ["diaggrok @ git+https://github.com/lukejenkins/diaggrok"]
+
+[project.scripts]
+diaggulp = "diaggulp:main"
+
+[tool.pytest.ini_options]
+# `pytest -m "not decode"` runs the base suite with diaggrok absent; `-m decode`
+# selects the single live-decode test that needs the [decode] extra. Registered
+# here (the carve ships no pytest.ini) so neither invocation warns.
+markers = [
+    "decode: exercises the optional diaggrok `--decode` path (needs diaggulp[decode])",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+# Single-module package. In the public carve, `diaggulp.py` (today at
+# tools/diaggulp.py in the chp monorepo) is copied to the repo root beside this
+# file — see STAGING.md.
+[tool.setuptools]
+py-modules = ["diaggulp"]
