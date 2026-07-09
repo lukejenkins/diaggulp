@@ -1,4 +1,4 @@
-diaggulp — low-CPU host-side Qualcomm DIAG capture
+diaggulp: low-CPU host-side Qualcomm DIAG capture
 Copyright 2026 Luke Jenkins
 
 This product includes software developed by Luke Jenkins
@@ -12,8 +12,8 @@ Acknowledgements
 ------------------------------------------------------------------------
 
 Host-side Qualcomm DIAG capture and decoding was pioneered by projects
-including QCSuper and SCAT. diaggulp does not incorporate their code — it
-is a first-party implementation of just the capture step — but it stands
+including QCSuper and SCAT. diaggulp does not incorporate their code; it
+is a first-party implementation of just the capture step, but it stands
 on the reverse-engineering and documentation those projects contributed
 to the community, and interoperates with them by design.
 
