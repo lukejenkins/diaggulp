@@ -1212,10 +1212,13 @@ class LiveDecoder:
     _MAXSIZE = 256
 
     def __init__(self, codes: "Optional[set[int]]", out=None,
-                 verify_crc: bool = True):
+                 verify_crc: bool = True, pcap_sink=None,
+                 emit_jsonl: bool = True):
         self.codes = codes
         self.out = out if out is not None else sys.stderr
         self.verify_crc = verify_crc
+        self.pcap_sink = pcap_sink      # diagmunge PcapSink or None
+        self.emit_jsonl = emit_jsonl    # False when only --pcap-out is active
         self._q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=self._MAXSIZE)
         self._thread: "Optional[threading.Thread]" = None
         self._sentinel = object()
@@ -1264,6 +1267,7 @@ class LiveDecoder:
             self.decoded += 1
             self.code_counts[code] = self.code_counts.get(code, 0) + 1
             decoded = None
+            rec = None
             try:
                 rec = registry.parse(code, ts, payload)
                 if rec is not None:
@@ -1277,6 +1281,14 @@ class LiveDecoder:
             except Exception as exc:  # a parser bug must not kill the thread
                 self.parse_errors += 1
                 decoded = {"_parse_error": str(exc)}
+            if self.pcap_sink is not None and rec is not None:
+                import time
+                try:
+                    self.pcap_sink.write_record(code, time.time(), rec)
+                except Exception:
+                    pass  # a pcap-encode bug must not kill the capture thread
+            if not self.emit_jsonl:
+                continue
             line = json.dumps({"code": f"0x{code:04X}", "ts": ts,
                                "decoded": decoded}, default=str)
             try:
@@ -1787,6 +1799,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="#N: write the live-decode JSONL here instead of stderr "
              "(one decoded record per line). The capture's own raw/DLF outputs "
              "are unaffected.",
+    )
+    parser.add_argument(
+        "--pcap-out", default=None, metavar="PATH",
+        help="ONE-SHOT LIVE PCAP: while capturing, also write a "
+             "Wireshark-readable GSMTAP pcap here (LTE RRC/NAS on UDP/4729) "
+             "plus a sibling .nr.pcap for NR signalling (Exported-PDU). Runs "
+             "on the live-decode side thread; the raw capture (-o) is "
+             "unaffected. Frame timestamps are arrival wall-clock. Requires "
+             "the diaggrok decode extra (imported lazily).",
     )
     parser.add_argument(
         "--ext-msg-f3", action=argparse.BooleanOptionalAction, default=True,
@@ -2374,17 +2395,42 @@ def main(argv: Optional[list[str]] = None) -> int:
     # queue, so the raw-capture hot path is untouched (the .bin stays canonical).
     live_decoder = None
     _decode_out_fh = None
-    if args.decode or args.decode_live:
+    _pcap_files = None
+    _pcap_nr_path = None
+    _pcap_sink = None
+    if args.decode or args.decode_live or args.pcap_out:
         decode_codes = set(args.decode) if args.decode else None
+        if args.pcap_out:
+            # Lazy: pull the diaggrok-backed pcap core only when --pcap-out is
+            # set, preserving diaggulp's decoder-free base package.
+            from diagmunge.munge.dlf_to_pcap import PcapSink, _open_outputs
+            from diaggrok.gsmtap import pcap_eligible_codes
+            _pcap_out = Path(args.pcap_out)
+            writer, nr_writer, _pcap_files, _pcap_nr_path = _open_outputs(_pcap_out)
+            _pcap_sink = PcapSink(writer, nr_writer=nr_writer)
+            # Broaden the decode filter to include pcap-eligible codes so they
+            # reach the sink; a code with no encoder is simply skip-tallied.
+            pe = set(pcap_eligible_codes())
+            if decode_codes is not None:
+                decode_codes = decode_codes | pe
+            elif not args.decode_live:
+                decode_codes = pe   # pcap-only: parse just the eligible codes
         if args.decode_out:
             _decode_out_fh = open(args.decode_out, "w", encoding="utf-8")
-        live_decoder = LiveDecoder(decode_codes, out=_decode_out_fh)
+        emit_jsonl = bool(args.decode or args.decode_live)
+        live_decoder = LiveDecoder(
+            decode_codes, out=_decode_out_fh, pcap_sink=_pcap_sink,
+            emit_jsonl=emit_jsonl)
         live_decoder.start()
-        scope = (", ".join(f"0x{c:04X}" for c in sorted(decode_codes))
-                 if decode_codes else "ALL log codes in the mask")
-        print(f"diaggulp[live]: decoding {scope} → "
-              f"{args.decode_out or 'stderr'} (raw .bin unaffected)",
-              file=sys.stderr)
+        if emit_jsonl:
+            scope = (", ".join(f"0x{c:04X}" for c in sorted(decode_codes))
+                     if decode_codes else "ALL log codes in the mask")
+            print(f"diaggulp[live]: decoding {scope} → "
+                  f"{args.decode_out or 'stderr'} (raw .bin unaffected)",
+                  file=sys.stderr)
+        if args.pcap_out:
+            print(f"diaggulp[pcap]: live GSMTAP/NR pcap → {args.pcap_out} "
+                  f"(raw .bin unaffected)", file=sys.stderr)
     tee_fn = live_decoder.feed if live_decoder is not None else None
 
     # --- The hot loop ---
@@ -2434,6 +2480,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             live_decoder.stop()
             if _decode_out_fh is not None:
                 _decode_out_fh.close()
+            if _pcap_files is not None:
+                from diagmunge.munge.dlf_to_pcap import _finalize_outputs
+                _finalize_outputs(_pcap_files, _pcap_nr_path,
+                                  _pcap_sink.nr_written)
+                print(f"diaggulp[pcap]: {_pcap_sink.written} GSMTAP + "
+                      f"{_pcap_sink.nr_written} NR frame(s) -> {args.pcap_out}",
+                      file=sys.stderr, flush=True)
 
         # --- Stop NMEA side-capture (isolated; never blocks DIAG teardown) ---
         if nmea_sidecar is not None:
