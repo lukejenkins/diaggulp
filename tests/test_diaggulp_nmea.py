@@ -1,4 +1,4 @@
-"""Tests for diaggulp's NMEA side-capture (the NMEA section of tools/diaggulp.py).
+"""Tests for diaggulp's NMEA side-capture (the NMEA section of diaggulp.py).
 
 Pure-logic + mocked-sysfs only; no hardware, no pyserial required.
 """

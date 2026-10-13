@@ -1,15 +1,15 @@
-"""Tests for diaggulp's bounded F3 arming — per-subsystem SET_RT_MASK (#N).
+"""Tests for diaggulp's bounded F3 arming — per-subsystem SET_RT_MASK.
 
 ``_enable_ext_msg_f3`` arms the modem's *entire* F3 surface with
-DIAG_EXT_MSG_CONFIG_F / SET_ALL_RT_MASKS (sub_cmd 5). #N adds the bounded
-primitive — SET_RT_MASK (sub_cmd 4) — so a capture can arm F3 for just the
+DIAG_EXT_MSG_CONFIG_F / SET_ALL_RT_MASKS (sub_cmd 5). The bounded
+primitive — SET_RT_MASK (sub_cmd 4) — lets a capture arm F3 for just the
 SSIDs of interest at a chosen severity, instead of the all-or-nothing default
 that emitted ~660k 0x99 frames in 30s on the RM500Q-AE pilot.
 
 These tests pin the *wire format* of the request builders and the severity-mask
 arithmetic — the parts verifiable offline. The protocol's live behaviour
 (does the modem accept SET_RT_MASK and arm exactly the requested SSIDs?) is the
-≥2-chipset hardware-validation item that stays open on #N.
+≥2-chipset hardware-validation item that stays open.
 """
 from __future__ import annotations
 
@@ -29,14 +29,30 @@ import diaggulp as d  # noqa: E402
 
 def test_set_rt_mask_wire_format():
     # cmd_code (0x7D) is prepended by _send_recv, so the payload starts at
-    # sub_cmd: 04 | ss_id_first(LE u16) | ss_id_last(LE u16) | rt_mask(LE u32).
+    # sub_cmd: 04 | ss_id_first(LE u16) | ss_id_last(LE u16) | status(LE u16)
+    #             | rt_mask(LE u32) x (last - first + 1).
+    #
+    # ⛔ Rewritten against real hardware. The previous expectation was
+    # `04 0900 0900 1c000000` — no status field, mask at offset 5 — and it was
+    # WRONG on real hardware. It could never have failed, because it was built
+    # from the same assumption the builder held; the two agreed with each other
+    # and both disagreed with the modem. Measured on a live EG25-G (MDM9607) by
+    # reading the runtime table back with sub_cmd 3: the old form made ss 7 <-
+    # 0x01020408 store 0xA2CC0102, whose low half is literally bytes 7 and 8 of
+    # our own request, i.e. the firmware reads the mask at offset 7.
     payload = d._build_ext_msg_set_rt_mask(0x0009, 0x0009, 0x0000001C)
-    assert payload == bytes.fromhex("04" "0900" "0900" "1c000000")
+    assert payload == bytes.fromhex("04" "0900" "0900" "0000" "1c000000")
+    assert int.from_bytes(payload[7:11], "little") == 0x0000001C
 
 
 def test_set_rt_mask_distinct_range():
+    # ⛔ Also rewritten: the field after the range is a `status`
+    # u16, and the mask is an ARRAY of one u32 per ss_id — not a single value
+    # broadcast over the range. Measured: a lone u32 sent for 30..35 set entry
+    # 30 correctly, entry 31 to out-of-buffer garbage, and left 32..35 alone.
     payload = d._build_ext_msg_set_rt_mask(0x0008, 0x000A, 0xFFFFFFFF)
-    assert payload == pack("<BHHI", 4, 0x0008, 0x000A, 0xFFFFFFFF)
+    assert payload == pack("<BHHH", 4, 0x0008, 0x000A, 0) + pack("<I", 0xFFFFFFFF) * 3
+    assert len(payload) == 7 + 4 * 3
 
 
 def test_set_rt_mask_rejects_out_of_range_ssid():
@@ -81,25 +97,38 @@ def test_level_unknown_raises():
 # --- QUERY_SSID_RANGES (sub_cmd 1) ------------------------------------------
 
 def test_query_ss_ranges_request_byte():
-    # Matches the request tools/diag_probe_log_gen.py already sends.
+    # Matches the request the probe-log generator already sends.
     assert d._build_ext_msg_query_ss_ranges() == b"\x01"
 
 
+# ⚠️ These three were written against the ASSUMED QUERY_SSID_RANGES layout
+# (num_ranges @1, array @3) and built their own bodies to match it, so they were
+# self-fulfilling: no synthetic fixture derived from the parser's own assumption
+# can ever catch that assumption being wrong. The layout was hardware-verified on
+# a live EG25-G and is `status u16 @1, num_ranges u16 @3,
+# reserved u16 @5, array @7`; the bodies below are rebuilt to it. The real-wire
+# fixtures live in test_diaggulp_ext_msg_readbacks_4109.py — prefer
+# those, and keep these as the synthetic edge cases they were always for.
+def _ss_ranges_body(num: int, *pairs: tuple[int, int]) -> bytes:
+    """Build a QUERY_SSID_RANGES reply body at the verified offsets."""
+    return pack("<BHHH", 1, 1, num, 0) + b"".join(pack("<HH", a, b) for a, b in pairs)
+
+
 def test_parse_ss_ranges_roundtrip():
-    body = pack("<BH", 1, 2) + pack("<HH", 0x0008, 0x000A) + pack("<HH", 0x0200, 0x0203)
+    body = _ss_ranges_body(2, (0x0008, 0x000A), (0x0200, 0x0203))
     assert d._parse_ext_msg_ss_ranges(body) == [(0x0008, 0x000A), (0x0200, 0x0203)]
 
 
 def test_parse_ss_ranges_tolerates_short_buffer():
     # num_ranges claims 3 but only 1 pair present → return what's well-formed,
-    # never raise on a garbled tail (the response shape is hardware-unverified).
-    body = pack("<BH", 1, 3) + pack("<HH", 0x0010, 0x0010)
+    # never raise on a garbled tail (a reply can be truncated on a busy port).
+    body = _ss_ranges_body(3, (0x0010, 0x0010))
     assert d._parse_ext_msg_ss_ranges(body) == [(0x0010, 0x0010)]
 
 
 def test_parse_ss_ranges_empty():
     assert d._parse_ext_msg_ss_ranges(b"") == []
-    assert d._parse_ext_msg_ss_ranges(b"\x01\x00") == []  # too short for num
+    assert d._parse_ext_msg_ss_ranges(b"\x01\x01\x00\x02\x00") == []  # header short
 
 
 # --- hex/decimal arg parsing -------------------------------------------------
@@ -113,7 +142,7 @@ def test_parse_int_arg_hex_and_decimal():
 
 
 def test_f3_preset_ml1_is_grounded_ssids():
-    # #N named preset: 'ml1' expands to the qdb-grounded LTE/NR ML1 + search
+    # Named preset: 'ml1' expands to the qdb-grounded LTE/NR ML1 + search
     # ss_ids (verified stable across SDX55 WLSN/SIM8202 + SDX62 RM520N-GL).
     assert d._F3_PRESETS["ml1"] == (1007, 3001, 9509, 9520)
 

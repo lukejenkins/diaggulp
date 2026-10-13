@@ -1,11 +1,11 @@
-"""Tests for the diaggulp offline pcap replay path (--transport pcap, #N).
+"""Tests for the diaggulp offline pcap replay path (--transport pcap).
 
 These build synthetic classic-pcap captures of the diagbarf DGE1 UDP broadcast
 and assert that the replay reassembles the same raw-HDLC byte stream the live
 ``udp-listen`` path produces, with identical gap accounting. A synthetic pcap
 is the correct test artifact here: this exercises a standard-file-format reader
 + the shared DGE1 deframer, not on-wire parser correctness (no real diagbarf
-pcap was archived from the #N validation — see the issue follow-up).
+pcap was archived from the hardware validation).
 """
 from __future__ import annotations
 
@@ -23,6 +23,14 @@ sys.modules.setdefault("serial", MagicMock())
 
 import diaggulp  # noqa: E402
 from diagmunge import Dge1SeqTracker, parse_dge1_header  # noqa: E402
+
+import pytest  # noqa: E402
+
+# The pcap replay core lives in diaggrok.diag_source, which a public diaggrok
+# does not ship (it imports diagmunge). Without it --pcap refuses cleanly.
+needs_pcap_replay = pytest.mark.skipif(
+    not diaggulp.pcap_replay_available(),
+    reason="diaggrok.diag_source absent: no --pcap replay in this install")
 
 
 # --- synthetic frame builders -------------------------------------------------
@@ -116,7 +124,7 @@ def test_seq_tracker_gap_and_dup():
 
 def test_seq_tracker_true_duplicate_vs_reorder():
     """A repeated seq is a true (on-wire/stack) duplicate; an out-of-order
-    never-seen seq is a reorder. #N disambiguation."""
+    never-seen seq is a reorder."""
     t = Dge1SeqTracker()
     t.track(5, False)
     t.track(6, False)
@@ -128,7 +136,7 @@ def test_seq_tracker_true_duplicate_vs_reorder():
 
 
 def test_seq_tracker_pure_reordering_signature():
-    """#N core: a stream delivered ONCE each but heavily out of order is
+    """Core case: a stream delivered ONCE each but heavily out of order is
     scored as many duplicates + much 'loss' with ZERO true duplicates — the
     signature that the CFW-3212 ~8x/99.8% pattern is reordering, not real
     duplication or real loss."""
@@ -152,7 +160,7 @@ def test_seq_tracker_restart_no_loss():
     assert r["missing"] == 0 and r["restarts"] == 1 and r["received"] == 2
 
 
-# --- reorder buffer (#N) ---------------------------------------------------
+# --- reorder buffer ---------------------------------------------------
 
 def _pl(seq: int) -> bytes:
     """A distinguishable payload per seq so we can assert delivery ORDER."""
@@ -174,7 +182,7 @@ def test_reorder_window_zero_feed_matches_track():
 
 
 def test_reorder_buffer_resequences_within_window():
-    """The core #N fix: an out-of-order-but-present stream is delivered
+    """The core fix: an out-of-order-but-present stream is delivered
     IN ORDER with zero loss and zero reordered, when the displacement fits the
     window — matching the clean --transport pcap result."""
     # Window must exceed the max reorder displacement: seq 1 is "expected" early
@@ -270,7 +278,7 @@ def _drain_transport(tp):
 def test_udp_listen_transport_reorders_end_to_end():
     """End-to-end through _UdpListenTransport.read(): a reordered DGE1 stream
     with the window enabled is delivered in order and flushed at EOF, matching
-    the #N acceptance (live udp-listen approaches the clean pcap result)."""
+    the acceptance criterion: live udp-listen approaches the clean pcap result."""
     from diagmunge.transport import _UdpListenTransport
     # seq 0 first establishes the baseline, then later seqs swap in pairs.
     order = [0, 2, 1, 4, 3, 6, 5, 7]
@@ -295,6 +303,7 @@ def test_udp_listen_transport_window_zero_drops_reorder():
 
 # --- pcap reader --------------------------------------------------------------
 
+@needs_pcap_replay
 def test_roundtrip_ethernet_ipv4():
     payloads = [b"\x7e\xAA\xBB", b"\x7e\xCC", b"\x7e\xDD\xEE"]
     frames = [eth_ipv4_udp(12399, dge1(i, p)) for i, p in enumerate(payloads, start=1)]
@@ -320,6 +329,7 @@ def test_port_filter_excludes_other_ports():
     assert len(list(diaggulp.iter_pcap_udp_payloads(pcap, port=None))) == 3
 
 
+@needs_pcap_replay
 def test_malformed_and_gap_counts():
     frames = [
         eth_ipv4_udp(12399, dge1(5, b"\x7e\xAA")),
@@ -337,25 +347,25 @@ def test_malformed_and_gap_counts():
 def test_vlan_tagged_ethernet():
     frames = [eth_ipv4_udp(12399, dge1(1, b"\x7e\xAB"), vlan=46)]
     pcap = _write_tmp(make_pcap(frames))
-    assert list(diaggulp.iter_pcap_udp_payloads(pcap, port=12399)) == [dge1(1, b"\x7e\xAB")]
+    assert [p for _ts, p in diaggulp.iter_pcap_udp_payloads(pcap, port=12399)] == [dge1(1, b"\x7e\xAB")]
 
 
 def test_ipv6_udp():
     frames = [eth_ipv6_udp(12399, dge1(1, b"\x7e\xCD"))]
     pcap = _write_tmp(make_pcap(frames))
-    assert list(diaggulp.iter_pcap_udp_payloads(pcap, port=12399)) == [dge1(1, b"\x7e\xCD")]
+    assert [p for _ts, p in diaggulp.iter_pcap_udp_payloads(pcap, port=12399)] == [dge1(1, b"\x7e\xCD")]
 
 
 def test_linux_sll_linktype():
     frames = [sll_ipv4_udp(12399, dge1(1, b"\x7e\xEF"))]
     pcap = _write_tmp(make_pcap(frames, linktype=113))
-    assert list(diaggulp.iter_pcap_udp_payloads(pcap, port=12399)) == [dge1(1, b"\x7e\xEF")]
+    assert [p for _ts, p in diaggulp.iter_pcap_udp_payloads(pcap, port=12399)] == [dge1(1, b"\x7e\xEF")]
 
 
 def test_big_endian_pcap():
     frames = [eth_ipv4_udp(12399, dge1(1, b"\x7e\x99"))]
     pcap = _write_tmp(make_pcap(frames, endian="big"))
-    assert list(diaggulp.iter_pcap_udp_payloads(pcap, port=12399)) == [dge1(1, b"\x7e\x99")]
+    assert [p for _ts, p in diaggulp.iter_pcap_udp_payloads(pcap, port=12399)] == [dge1(1, b"\x7e\x99")]
 
 
 def test_pcapng_rejected():
@@ -375,6 +385,7 @@ def test_bad_magic_rejected():
 
 # --- CLI end-to-end -----------------------------------------------------------
 
+@needs_pcap_replay
 def test_main_pcap_writes_dlf_and_sidecar():
     payloads = [b"\x7e\xAA\xBB", b"\x7e\xCC"]
     frames = [eth_ipv4_udp(12399, dge1(i, p)) for i, p in enumerate(payloads, start=1)]
@@ -389,6 +400,7 @@ def test_main_pcap_writes_dlf_and_sidecar():
     assert sidecar["received"] == 2 and sidecar["missing"] == 0
 
 
+@needs_pcap_replay
 def test_main_pcap_explicit_port_override():
     frames = [eth_ipv4_udp(2500, dge1(1, b"\x7e\x42"))]
     pcap = _write_tmp(make_pcap(frames))
@@ -401,6 +413,39 @@ def test_main_pcap_explicit_port_override():
     assert sidecar["port"] == 2500
 
 
+@needs_pcap_replay
+def test_main_pcap_replay_is_exempt_from_the_free_space_floor():
+    """An offline pcap replay must NOT inherit the live-capture disk floor.
+
+    The floor exists to refuse to *start* a live capture of unbounded length on a
+    nearly-full filesystem (a full disk wedges syncthing's corpus folder fleet-
+    wide). A replay's output is bounded by an input pcap that already fits on that
+    same disk, so the hazard does not apply — which is what the guard's own comment
+    has claimed since it was written, without the code ever checking the transport.
+
+    ``--min-free-pct 100`` is unsatisfiable on any real filesystem, so this fails
+    on every host if the exemption regresses — unlike the host-dependent red the
+    two CLI end-to-end tests above used to produce.
+    """
+    frames = [eth_ipv4_udp(12399, dge1(1, b"\x7e\x42"))]
+    pcap = _write_tmp(make_pcap(frames))
+    out = tempfile.mktemp(suffix=".dlf")
+    rc = diaggulp.main(["--transport", "pcap", "--pcap", pcap, "-o", out,
+                        "--min-free-pct", "100", "--quiet"])
+    assert rc == 0
+    assert Path(out).read_bytes() == b"\x7e\x42"
+
+
+def test_main_live_transport_still_honours_the_free_space_floor():
+    """Positive control for the exemption above: a LIVE transport must still be
+    refused below the floor. A fix that simply weakened the guard would pass the
+    exemption test and silently delete the protection this guard exists for."""
+    rc = diaggulp.main(["/dev/null", "--transport", "serial",
+                        "-o", tempfile.mktemp(suffix=".dlf"),
+                        "--min-free-pct", "100", "--quiet"])
+    assert rc == 2
+
+
 def test_main_pcap_missing_file():
     rc = diaggulp.main(["--transport", "pcap", "--pcap", "/no/such/file.pcap",
                         "-o", tempfile.mktemp(), "--quiet"])
@@ -410,3 +455,13 @@ def test_main_pcap_missing_file():
 def test_main_pcap_requires_pcap_arg():
     rc = diaggulp.main(["--transport", "pcap", "--quiet"])
     assert rc == 2
+
+
+def test_main_pcap_refuses_cleanly_without_the_replay_core(monkeypatch, capsys):
+    monkeypatch.setattr(diaggulp, "pcap_replay_available", lambda: False)
+    pcap = _write_tmp(make_pcap([eth_ipv4_udp(12399, dge1(1, b"\x7e\x42"))]))
+    out = tempfile.mktemp(suffix=".dlf")
+    rc = diaggulp.main(["--transport", "pcap", "--pcap", pcap, "-o", out, "--quiet"])
+    assert rc == 2
+    assert "diaggrok.diag_source" in capsys.readouterr().err
+    assert not Path(out).exists(), "a refusal must not leave an output file behind"

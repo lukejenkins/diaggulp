@@ -1,4 +1,4 @@
-"""Tests for tools/diaggulp.py."""
+"""Tests for the diaggulp capture tool."""
 
 import os
 import sys
@@ -35,7 +35,7 @@ class _FakeSpcClient:
 
 
 class TestSpcUnlock:
-    """#N — _try_spc_unlock orchestration over DiagClient.unlock_spc."""
+    """_try_spc_unlock orchestration over DiagClient.unlock_spc."""
 
     def test_auto_tries_vendor_list_in_order_until_accepted(self):
         # The Telit-form 0000 is accepted; auto must try 000000 first.
@@ -200,7 +200,7 @@ class TestSlurpLoop:
         assert bytes_written == 0  # interrupted before any data
 
     def test_slurp_survives_transient_mhi_reset(self, tmp_path):
-        """#N — a transient ERESTARTSYS(512)/EAGAIN reset mid-capture must be
+        """A transient ERESTARTSYS(512)/EAGAIN reset mid-capture must be
         ridden out: the post-reset data still lands in one contiguous file."""
         import errno as _errno
         reset = OSError(512, "ERESTARTSYS")          # errno auto-set from arg0
@@ -262,7 +262,7 @@ class TestSlurpLoop:
             os.close(out_fd)
 
     def test_slurp_reopens_channel_on_persistent_reset(self, tmp_path):
-        """#N re-open gap: when a reset outlasts the same-fd ride-out
+        """Re-open gap: when a reset outlasts the same-fd ride-out
         (REOPEN_AFTER_SECONDS) and a reconnect_fn is supplied, slurp re-opens the
         channel (open()+re-arm) and capture resumes on the FRESH fd. Models the
         T99W640 hard MHI DIAG teardown where retrying the stale fd never recovers."""
@@ -296,7 +296,7 @@ class TestSlurpLoop:
 
 
 class TestNarrowMaskBytes:
-    """Pure narrow-mask builder for #N validation captures.
+    """Pure narrow-mask builder for validation captures.
 
     16 log types; give the type under test a generous bitsize so item indices
     fit, and exercise the (equipment_id<<12 | item) decomposition + bit layout.
@@ -306,10 +306,27 @@ class TestNarrowMaskBytes:
     # type 0x0 empty, rest small. Index = log type.
     BITSIZES = (0, 0x1000, 256, 0, 0, 0, 0, 0, 0, 0, 0, 0x1000, 0, 0, 0, 0)
 
+    # Every log type this BITSIZES tuple advertises (bitsize > 0). Since
+    # `e4b414901` the builder returns an entry for ALL of them —
+    # requested types carry their bits, the rest carry an explicit all-zero
+    # mask so they are WRITTEN to zero rather than inheriting whatever the
+    # previous run armed. Before that fix `--log-code` was additive across
+    # runs, and the leak always landed in a type the run never wrote.
+    ADVERTISED = {0x1, 0x2, 0xB}
+
+    def _assert_zeroed_except(self, masks, requested_types):
+        """Every advertised type is present; the unrequested ones are zero."""
+        assert set(masks) == self.ADVERTISED
+        for lt in self.ADVERTISED - set(requested_types):
+            assert not any(masks[lt]), (
+                f"log type 0x{lt:X} must be written to ZERO, not omitted — an "
+                f"omitted type keeps the previous run's mask"
+            )
+
     def test_single_code_sets_exactly_one_bit(self):
         # 0xB8D1 -> type 0xB, item 0x8D1 = 2257; byte 2257//8=282, bit 2257%8=1.
         masks = diaggulp._narrow_mask_bytes(self.BITSIZES, [0xB8D1])
-        assert set(masks) == {0xB}
+        self._assert_zeroed_except(masks, {0xB})
         mask = masks[0xB]
         assert len(mask) == (0x1000 + 7) // 8  # full type width
         assert mask[282] == 0b10  # bit 1 set
@@ -318,15 +335,15 @@ class TestNarrowMaskBytes:
     def test_multiple_codes_same_type_share_one_mask(self):
         # 0xB8D1 and 0xB885 both in type 0xB -> one mask, two bits set.
         masks = diaggulp._narrow_mask_bytes(self.BITSIZES, [0xB8D1, 0xB885])
-        assert set(masks) == {0xB}
+        self._assert_zeroed_except(masks, {0xB})
         assert sum(bin(b).count("1") for b in masks[0xB]) == 2
 
     def test_codes_in_different_types_split(self):
-        # 0x1875 -> type 0x1, 0xB8D1 -> type 0xB: two separate masks.
+        # 0x1875 -> type 0x1, 0xB8D1 -> type 0xB: one bit each, in their own mask.
         masks = diaggulp._narrow_mask_bytes(self.BITSIZES, [0x1875, 0xB8D1])
-        assert set(masks) == {0x1, 0xB}
-        for lt, mask in masks.items():
-            assert sum(bin(b).count("1") for b in mask) == 1
+        self._assert_zeroed_except(masks, {0x1, 0xB})
+        for lt in (0x1, 0xB):
+            assert sum(bin(b).count("1") for b in masks[lt]) == 1
 
     def test_dedups_repeated_codes(self):
         masks = diaggulp._narrow_mask_bytes(self.BITSIZES, [0xB8D1, 0xB8D1])
@@ -349,7 +366,7 @@ class TestNarrowMaskBytes:
 
 class TestAllLogsMaskBytes:
     """Pure all-bits-set mask builder shared by the default and telit-quirk
-    all-logs handshakes (#N). A SET_MASK for a log type must carry a
+    all-logs handshakes. A SET_MASK for a log type must carry a
     ceil(bitsize/8)-byte mask with every advertised item bit set and no
     out-of-range bits in the final byte."""
 
@@ -380,7 +397,7 @@ class TestAllLogsMaskBytes:
 
 
 class TestTelitLogConfigReplyMatches:
-    """Operation-field correlation for the telit-quirk handshake (#N).
+    """Operation-field correlation for the telit-quirk handshake.
 
     The shared _send_recv correlates only on the 1-byte opcode, but every
     DIAG_LOG_CONFIG_F sub-operation (RETRIEVE_RANGES=1, SET_MASK=3) shares
@@ -410,7 +427,7 @@ class TestTelitLogConfigReplyMatches:
 
 
 class TestSlurpKeepAlive:
-    """slurp() keep-alive kicks (#N). On a flush-on-OUT modem the passive
+    """slurp() keep-alive kicks. On a flush-on-OUT modem the passive
     read loop must periodically write a tiny OUT or the modem never flushes
     buffered LOG_F records. The kick callback fires on the kick interval even
     when no data arrives, and data is still written through untouched."""
@@ -504,10 +521,10 @@ class TestSlurpKeepAlive:
 
 
 class TestFlushOnOutQuirkMatch:
-    """Pure (vid, pid) allow-list match for the #N VID auto-detect."""
+    """Pure (vid, pid) allow-list match for the VID auto-detect."""
 
     def test_known_telit_lm960_matches(self):
-        # The one unit the quirk is live-validated against (#N).
+        # The one unit the quirk is live-validated against.
         label = diaggulp._match_flush_on_out_quirk(0x1BC7, 0x1041)
         assert label == "Telit LM960A18 (1bc7:1041)"
 

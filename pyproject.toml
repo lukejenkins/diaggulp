@@ -7,9 +7,16 @@ requires-python = ">=3.11"
 # Hard, import-time dependency: the DIAG transport core (DiagClient + DGE1
 # helpers), imported at module scope (diaggulp.py:108 `from diagmunge import …`).
 # Inward-only edge: diaggulp -> diagmunge -> diaggrok. Never the reverse.
-# Pinned to the public git remote: diagmunge is not on PyPI yet, so a bare name
-# would not resolve. Repoint to `diagmunge>=X.Y` once it is published.
-dependencies = ["diagmunge @ git+https://github.com/lukejenkins/diagmunge"]
+# diagmunge is not on PyPI yet, so a bare name would not resolve: it comes from
+# the public git remote, pinned to the release tag this package's suite was
+# verified against. Bump it with each re-verify; repoint to `diagmunge>=X.Y`
+# once it is published.
+# zstandard: diaggulp.py imports it at module scope (the .zst container
+# reader), so it is a hard dependency, not an extra.
+dependencies = [
+    "diagmunge @ git+https://github.com/lukejenkins/diagmunge@v2026.10.13",
+    "zstandard",
+]
 
 [project.optional-dependencies]
 # diaggulp's own serial reader imports pyserial lazily (diaggulp.py:1641) — only
@@ -18,10 +25,10 @@ dependencies = ["diagmunge @ git+https://github.com/lukejenkins/diagmunge"]
 serial = ["pyserial"]
 # Inline `--decode` imports diaggrok lazily (diaggulp.py:1256-1257). Bare
 # `pip install diaggulp` gives capture with zero diaggrok on the wheel;
-# `pip install diaggulp[decode]` wires the published decoder. (#N locked.)
+# `pip install diaggulp[decode]` wires the published decoder.
 # git-pinned for the same reason as diagmunge — diaggrok is public but not yet
 # on PyPI. Repoint to `diaggrok>=X.Y` once it is published.
-decode = ["diaggrok @ git+https://github.com/lukejenkins/diaggrok"]
+decode = ["diaggrok @ git+https://github.com/lukejenkins/diaggrok@v2026.10.12"]
 
 [project.scripts]
 diaggulp = "diaggulp:main"
@@ -38,8 +45,6 @@ markers = [
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
-# Single-module package. In the public carve, `diaggulp.py` (today at
-# tools/diaggulp.py in the monorepo) is copied to the repo root beside this
-# file — see STAGING.md.
+# Single-module package: `diaggulp.py` sits at the repo root beside this file.
 [tool.setuptools]
 py-modules = ["diaggulp"]

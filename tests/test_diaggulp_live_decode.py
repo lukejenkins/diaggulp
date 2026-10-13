@@ -1,4 +1,4 @@
-"""#N — live/streaming DIAG decode in diaggulp (LiveDecoder).
+"""Live/streaming DIAG decode in diaggulp (LiveDecoder).
 
 Decode a SELECTED set of log codes inline as frames arrive, on a side thread
 fed by a bounded queue. The contract: the raw capture is NEVER affected — under
@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 # This module imports diaggrok at top level — it exercises diaggulp's optional
-# --decode path (the future `diaggulp[decode]` extra, #N). Mark the whole
+# --decode path (the `diaggulp[decode]` extra). Mark the whole
 # module so the base capture suite runs green with `-m "not decode"` on a host
 # where diaggrok is absent, and skip cleanly rather than erroring at collection.
 pytestmark = pytest.mark.decode
@@ -116,6 +116,19 @@ def test_overload_drops_decode_copy_not_raw_bytes():
 
 
 def test_unparsed_code_triggers_one_time_novelty_alert(capsys):
+    # Precondition, asserted rather than assumed: this test's whole
+    # premise is that 0xFFFE has no parser. When another test leaks a synthetic
+    # 0xFFFE registration into the process-global registry, the alert correctly
+    # does not fire and the real assertion below fails as a bare `0 == 1` —
+    # which reads as a diaggulp bug and cost a full-suite bisect to disprove.
+    from diaggrok import registry as _reg
+    _leaked = _reg.parser_info(0xFFFE)
+    assert _leaked is None, (
+        "another test leaked a parser for the synthetic code 0xFFFE into the "
+        f"global diaggrok registry ({_leaked}). The root conftest's "
+        "_isolate_diaggrok_registry fixture should have restored it."
+    )
+
     out = io.StringIO()
     dec = diaggulp.LiveDecoder(codes={0xFFFE}, out=out)  # 0xFFFE: no parser
     dec.start()
