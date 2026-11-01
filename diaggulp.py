@@ -27,18 +27,13 @@ Downstream decoders must pick the matching input mode:
 Misusing the default QCSuper DLF mode on diaggulp output yields a near-zero
 parse rate (the HDLC delimiter bytes are not a valid DLF record header).
 
-Why this exists
----------------
+Design
+------
 
-QCSuper's pyserial input does ``self.serial.read()`` (one byte per call),
-appended to a Python bytes string with ``+=`` in a tight loop, then runs
-HDLC unescape + CRC-16 validation in pure Python on every frame. At
-sustained DIAG rates (~1 MB/s on SDX55+ modems with full LTE+GNSS+NR
-masks) this is **20-30% of a modern laptop CPU per modem** plus the
-buffer-overrun drops that follow (3700 dropped frames per 5-minute
-capture on FN980m).
-
-diaggulp.py is the minimum viable replacement:
+A modem with full LTE + GNSS + NR masks emits about 1 MB/s of DIAG, and a
+reader that does per-byte or per-frame work in Python at that rate costs CPU
+and drops frames when it falls behind. diaggulp does as little as possible on
+the capture path:
 
   1. Read in 64 KB chunks via ``select() + read()``
   2. Send the bytes straight to the output destination — **no HDLC
@@ -97,7 +92,13 @@ SIGINT and SIGTERM are wired to the same handler, which raises
 still prints a final stats line. The ``finally:`` teardown that follows is
 **bounded at every step**, so an ordinary
 ``timeout N diaggulp.py ...`` normally exits within a second or two of the
-signal.
+signal. SIGHUP (a dropped controlling shell) is wired the same way unless the
+run was started under ``nohup``. Once the teardown has started, further stop
+signals are held and a closed stderr pipe is ignored, so an impatient
+supervisor cannot cut the ``--disarm-*-on-exit`` / ``--restore-f3-mask-on-exit``
+steps short. Only SIGKILL can. To clear a modem that was left armed,
+run a brief quiesce: ``diaggulp ... -o /dev/null --disarm-logs-on-exit`` (add
+the other ``-on-exit`` flags for whatever else was armed).
 
 ``--seconds N`` / ``--duration N`` is the *native* way to bound a
 capture: the read loop stops on its own clock, takes that same clean-exit path,
@@ -150,6 +151,7 @@ import os
 import queue
 import select
 import signal
+import stat
 import struct
 import sys
 import tempfile
@@ -483,6 +485,12 @@ def _open_output(path: str) -> tuple[int, str]:
     # O_TRUNC in the open flags the loser of the race has already destroyed the
     # winner's capture by the time flock tells it to back off.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    # A non-regular sink (`-o /dev/null` for the quiesce recipe, a FIFO) has no
+    # length to truncate (ftruncate raises EINVAL) and no capture to protect:
+    # the flock would only make two concurrent quiesce runs refuse each other
+    #.
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        return fd, path
     _claim_output_fd(fd, path)
     os.ftruncate(fd, 0)
     return fd, path
@@ -575,6 +583,23 @@ def build_log_config_set_mask_request(
     return pack("<3xIII", LOG_CFG_SET_MASK, log_type, num_items) + mask
 
 
+def _require_nonzero_log_ranges(bitsizes: "tuple[int, ...]") -> None:
+    """Fail the all-logs handshake on a success-with-all-zero RETRIEVE_RANGES.
+
+    Seen on an SDX72 module: status 0 and all 16 bitsizes 0, so no mask gets
+    set. The arm used to report ``subscribed to all 0 log codes across 0 log
+    groups``, which reads like success, and the capture then had no ``0x10``
+    plane. Raising lets the caller's retry loop try again and puts the reason on
+    stderr. The cause is not known yet; the same units answered non-zero later.
+    """
+    if not any(bitsizes):
+        raise RuntimeError(
+            "RETRIEVE_RANGES returned success but all 16 log-type bitsizes are 0 "
+            "— no log mask can be set, so the classic 0x10 log plane will be EMPTY "
+            ""
+        )
+
+
 def _build_all_logs_mask(client: DiagClient) -> None:
     """Send a log mask that subscribes to EVERY log code in EVERY group.
 
@@ -605,6 +630,7 @@ def _build_all_logs_mask(client: DiagClient) -> None:
         raise RuntimeError(f"RETRIEVE_RANGES failed (status={status})")
 
     bitsizes = unpack_from("<16I", resp, calcsize(LOG_CFG_HDR_FMT))
+    _require_nonzero_log_ranges(bitsizes)
 
     enabled_groups = 0
     total_codes = 0
@@ -1044,8 +1070,10 @@ def _qsh_maskset_status(body: bytes) -> int:
 QSH_TRACE_PAYLOAD_OPCODE = 0x9D
 
 
-def _count_qsh_trace_frames(client: DiagClient, seconds: float) -> "int | None":
-    """Count ``0x9D`` frames (bare or 0x98-wrapped) arriving over ``seconds``.
+def _count_opcode_frames(
+    client: DiagClient, seconds: float, opcodes: "tuple[int, ...]",
+) -> "dict[int, int] | None":
+    """Count frames per opcode in ``opcodes`` (bare or 0x98-wrapped) over ``seconds``.
 
     Peeks each frame's head with :mod:`diagmunge.framefilter` and never unescapes
     the body. Returns ``None`` when the transport closes mid-window. A frame cut
@@ -1054,20 +1082,30 @@ def _count_qsh_trace_frames(client: DiagClient, seconds: float) -> "int | None":
     from diagmunge.framefilter import FrameSplitter, peek
 
     split = FrameSplitter()
-    n = 0
+    counts = dict.fromkeys(opcodes, 0)
     end = time.monotonic() + seconds
     while True:
         left = end - time.monotonic()
         if left <= 0:
-            return n
+            return counts
         try:
             chunk = client.read_raw(timeout=min(left, 0.25))
         except EOFError:
             return None
         for esc in split.feed(chunk):
             pk = peek(esc)
-            if pk is not None and QSH_TRACE_PAYLOAD_OPCODE in (pk.opcode, pk.inner_opcode):
-                n += 1
+            if pk is None:
+                continue
+            for op in opcodes:
+                if op in (pk.opcode, pk.inner_opcode):
+                    counts[op] += 1
+                    break
+
+
+def _count_qsh_trace_frames(client: DiagClient, seconds: float) -> "int | None":
+    """Count ``0x9D`` frames (bare or 0x98-wrapped) arriving over ``seconds``."""
+    counts = _count_opcode_frames(client, seconds, (QSH_TRACE_PAYLOAD_OPCODE,))
+    return None if counts is None else counts[QSH_TRACE_PAYLOAD_OPCODE]
 
 
 def _disarm_qsh_trace(
@@ -1133,6 +1171,128 @@ def _disarm_qsh_trace(
           f"flowing — {rates}; treat the maskset as armed",
           file=sys.stderr)
     return False
+
+
+#: The two streams ``--disarm-logs-on-exit`` stops: DIAG_LOG_F records
+#: (armed by the LOG_CONFIG mask) and DIAG_EVENT_REPORT_F packets.
+LOG_F_OPCODE = 0x10
+EVENT_REPORT_OPCODE = 0x60
+#: LOG_CONFIG operation 0: disable every log code in every log type.
+LOG_CFG_DISABLE = 0
+#: An unanswered disarm is re-sent this many times in all. On a port still
+#: streaming at full rate the reply can be lost in the flood.
+DISARM_ATTEMPTS = 3
+
+
+def _send_log_disable(client: DiagClient, *, telit_quirk: bool = False) -> str:
+    """LOG_CONFIG op 0. Returns ``"ok"``, ``"rejected"`` or ``"no-reply"``."""
+    from struct import pack
+
+    payload = pack("<3xI", LOG_CFG_DISABLE)
+    for _ in range(DISARM_ATTEMPTS):
+        if telit_quirk:
+            body = _telit_log_config_xact(client, LOG_CFG_DISABLE, payload)
+            res = None if body is None else (_DIAG_LOG_CONFIG_F, body)
+        else:
+            res = client._send_recv(
+                _DIAG_LOG_CONFIG_F, payload, timeout=5.0,
+                match=lambda op, b: log_config_reply_matches(op, b, LOG_CFG_DISABLE),
+            )
+        if res is not None:
+            return "rejected" if res[0] == DIAG_BAD_CMD_F else "ok"
+    return "no-reply"
+
+
+def _send_events_off(client: DiagClient) -> str:
+    """EVENT_REPORT_F off. Returns ``"ok"``, ``"rejected"`` or ``"no-reply"``.
+
+    The reply shares opcode 0x60 with the unsolicited event packets, so while
+    events are flowing an event can be taken for the reply. The stream census in
+    :func:`_disarm_logs_and_events` is the proof, not this return value.
+    """
+    inner = build_event_report_enable(False)
+    for _ in range(DISARM_ATTEMPTS):
+        res = client._send_recv(inner[0], inner[1:], timeout=5.0)
+        if res is not None:
+            return "rejected" if res[0] == DIAG_BAD_CMD_F else "ok"
+    return "no-reply"
+
+
+def _disarm_logs_and_events(
+    client: DiagClient, *, telit_quirk: bool = False,
+    sample_s: float = 2.5, settle_s: float = 2.0,
+) -> dict:
+    """Clear the log mask and event reporting, and VERIFY on the stream.
+
+    Both are modem-side sticky: they outlive the DIAG session and are cleared
+    only by a re-enumeration. A MiFi 6620L (MDM9625) kept streaming ~600 KB/s
+    after a ``--seconds 60`` run until LOG_CONFIG op 0 and ``0x60 00`` were sent
+    by hand. Neither mask can be read back, so like the QSH maskset
+    they are cleared, not restored.
+
+    ``0x10`` and ``0x60`` frames are counted over a window before the disarm and
+    again after a settle (the same windows as :func:`_disarm_qsh_trace`, sized
+    for the T99W175's ~1.27 s DIAG flush). A plane still flowing after
+    the first disarm gets its command re-sent once and is counted again. Per
+    plane, the verdict is ``verified`` (flowing before, 0 after), ``unverified``
+    (nothing flowing before: the gauge never read positive), ``still-flowing``,
+    or ``unknown`` (the transport closed). Never raises.
+    """
+    planes = (("log", LOG_F_OPCODE), ("events", EVENT_REPORT_OPCODE))
+    ops = tuple(op for _, op in planes)
+    senders = {
+        "log": lambda: _send_log_disable(client, telit_quirk=telit_quirk),
+        "events": lambda: _send_events_off(client),
+    }
+    report: dict = {}
+    try:
+        pre = _count_opcode_frames(client, sample_s, ops)
+        sent = {name: senders[name]() for name, _ in planes}
+        _count_opcode_frames(client, settle_s, ops)
+        post = _count_opcode_frames(client, sample_s, ops)
+        resent = []
+        if post is not None:
+            resent = [name for name, op in planes if post[op]]
+            for name in resent:
+                sent[name] = senders[name]()
+            if resent:
+                _count_opcode_frames(client, settle_s, ops)
+                post = _count_opcode_frames(client, sample_s, ops)
+    except Exception as exc:  # teardown must never raise
+        print(f"diaggulp: ⚠️ log/event disarm raised ({exc}); treat the log mask "
+              "and event reporting as still armed", file=sys.stderr)
+        return {"error": str(exc)}
+    for name, op in planes:
+        before = None if pre is None else pre[op]
+        after = None if post is None else post[op]
+        if before is None or after is None:
+            verdict = "unknown"
+        elif after:
+            verdict = "still-flowing"
+        elif before:
+            verdict = "verified"
+        else:
+            verdict = "unverified"
+        report[name] = {"command": sent[name], "before": before, "after": after,
+                        "resent": name in resent, "verdict": verdict}
+    for name, label, cmd in (("log", "log mask", "LOG_CONFIG op 0"),
+                             ("events", "event reporting", "0x60 00")):
+        r = report[name]
+        rates = (f"0x{dict(planes)[name]:02X} {r['before']} frames in "
+                 f"{sample_s:g} s before, {r['after']} after")
+        if r["verdict"] == "verified":
+            print(f"diaggulp: disarmed {label} ({cmd}: {r['command']}), VERIFIED "
+                  f"on the stream — {rates}", file=sys.stderr)
+        elif r["verdict"] == "unverified":
+            print(f"diaggulp: {label} disarm sent ({cmd}: {r['command']}) but NOT "
+                  f"verified: nothing was flowing before it — {rates}",
+                  file=sys.stderr)
+        else:
+            print(f"diaggulp: ⚠️ {label} disarm ({cmd}: {r['command']}) — the "
+                  f"stream is {r['verdict'].upper()} — {rates}; the modem is "
+                  "LEFT ARMED, so every later reader of this port gets it. "
+                  "Reboot it (AT+CFUN=1,1) to clear", file=sys.stderr)
+    return report
 
 
 def _enable_events(client: DiagClient) -> None:
@@ -1848,6 +2008,61 @@ def _resync_frame_boundary(
                                  max_frames=max_frames)
 
 
+def _wait_diag_ready(
+    open_client,
+    wait_s: float,
+    *,
+    probe_timeout: float = 1.5,
+    first_backoff: float = 0.5,
+    max_backoff: float = 4.0,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> Optional[DiagClient]:
+    """Reopen until the DIAG function answers a ``DIAG_VERNO_F`` probe.
+
+    Right after a USB (re)enumeration the DIAG tty can exist before the
+    function answers: the T99W640's gadget re-compose made the first write die
+    with pyserial's ``SerialException`` ("device reports readiness to read but
+    returned no data"). That is an ``OSError``, so it is caught here along with
+    a node that is not there yet. A VERNO reply or a ``DIAG_BAD_CMD_F`` both
+    mean the function is answering. Each failed attempt closes its client and
+    backs off (doubling, capped) until ``wait_s`` runs out; returns None then.
+    """
+    deadline = clock() + wait_s
+    backoff = first_backoff
+    attempt = 0
+    while True:
+        attempt += 1
+        client = None
+        try:
+            client = open_client()
+            reply = client._send_recv(DIAG_VERNO_F, b"", timeout=probe_timeout)
+            if reply is not None and reply[0] in (DIAG_VERNO_F, DIAG_BAD_CMD_F):
+                if attempt > 1:
+                    print(f"diaggulp: DIAG ready after {attempt} attempts",
+                          file=sys.stderr)
+                return client
+            why = "no DIAG_VERNO_F reply" if reply is None else \
+                f"opcode {reply[0]:#04x} instead of DIAG_VERNO_F"
+        except OSError as exc:
+            why = f"{type(exc).__name__}: {exc}"
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 - closing a dead port is best-effort
+                pass
+        remaining = deadline - clock()
+        if remaining <= 0:
+            print(f"error: DIAG did not answer within --wait-ready {wait_s:.1f}s "
+                  f"(attempt {attempt}: {why})", file=sys.stderr)
+            return None
+        delay = min(backoff, remaining)
+        print(f"diaggulp: DIAG not ready (attempt {attempt}: {why}); reopening in "
+              f"{delay:.1f}s", file=sys.stderr)
+        sleep(delay)
+        backoff = min(backoff * 2, max_backoff)
+
+
 def _telit_write_pumped(
     client: DiagClient,
     opcode: int,
@@ -2241,6 +2456,42 @@ def _anchor_sidecar_doc(
     return doc
 
 
+def _rotation_boundary_anchor(host_mono_ns: int, host_unix_ns: int) -> dict:
+    """The anchor at a rotation boundary: host time, no modem exchange.
+
+    Same precision class as :func:`_host_bracket_anchor`, a host reading at a
+    stream boundary whose error is the modem-to-host buffering latency, and
+    like it no ``host_mono_recv_ns``. Unlike a VERNO pre-anchor it has no slack
+    between the anchor and the first record: it sits at the exact byte where
+    one segment ends and the next begins. A ``DIAG_VERNO_F`` mid-capture would
+    lose bytes instead, because ``_send_recv`` drains every frame it is not
+    waiting for.
+    """
+    return {"method": "rotation_boundary", "host_mono_ns": host_mono_ns,
+            "host_unix_ns": host_unix_ns}
+
+
+def _write_anchor_sidecar(capture_path: str, doc: dict, *, quiet: bool) -> None:
+    """Write ``<capture_path>.anchors.json``. Warns, never raises."""
+    sidecar_path = capture_path + ".anchors.json"
+    try:
+        with open(sidecar_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+            fh.write("\n")
+        if not quiet:
+            print(
+                f"diaggulp: wrote anchor sidecar {sidecar_path} "
+                f"({len(doc['anchors'])} anchor(s))",
+                file=sys.stderr,
+            )
+    except OSError as exc:
+        print(
+            f"warning: failed to write anchor sidecar "
+            f"{sidecar_path}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _build_all_logs_mask_telit(client: DiagClient) -> None:
     """All-logs handshake for the flush-on-OUT Telit/SDX20 path.
 
@@ -2248,6 +2499,7 @@ def _build_all_logs_mask_telit(client: DiagClient) -> None:
     but every transaction goes through the pumped/operation-correlated path.
     Assumes the caller already ran :func:`_telit_drain_bounded`."""
     bitsizes = _telit_retrieve_ranges(client)
+    _require_nonzero_log_ranges(bitsizes)
     enabled_groups = 0
     total_codes = 0
     for log_type, bitsize in enumerate(bitsizes):
@@ -2288,6 +2540,13 @@ class _RotatingWriter:
     The output path may contain ``%s`` which expands to the current
     Unix timestamp at file open. Rotation closes the current file and
     opens a fresh one with a new timestamp.
+
+    ``on_rotate`` (optional), set after construction, is called as
+    ``on_rotate(closed_path, new_path, host_mono_ns, host_unix_ns)`` once the
+    new segment is open. The two clocks are read right after the write that
+    crossed the threshold, so they mark the stream position where the closed
+    segment ends and the new one begins. Nothing is sent to the modem
+    and no byte is lost.
     """
 
     def __init__(
@@ -2316,6 +2575,7 @@ class _RotatingWriter:
         self._current_path = ""
         self._written = 0
         self._opened_at = 0.0
+        self.on_rotate: "Optional[callable]" = None
         self._open_new()
 
     def _open_new(self) -> None:
@@ -2333,12 +2593,19 @@ class _RotatingWriter:
         self._written += len(data)
         # Rotation check after each write
         if self._rotate_size and self._written >= self._rotate_size:
-            self._open_new()
+            self._rotate()
         elif (
             self._rotate_interval
             and (time.monotonic() - self._opened_at) >= self._rotate_interval
         ):
-            self._open_new()
+            self._rotate()
+
+    def _rotate(self) -> None:
+        closed = self._current_path
+        mono_ns, unix_ns = time.monotonic_ns(), time.time_ns()
+        self._open_new()
+        if self.on_rotate is not None:
+            self.on_rotate(closed, self._current_path, mono_ns, unix_ns)
 
     def close(self) -> None:
         if self._fd >= 0:
@@ -2405,6 +2672,59 @@ class ReplaySeamWatch:
                   "tools/oot-pcie-mhi-patches/0010-fix-sdx7x-diag-mtu-32k.patch "
                   "(dkms/install.sh) and reload the driver.",
                   file=sys.stderr, flush=True)
+
+
+class _TolerantStream:
+    """A stream whose writes cannot raise.
+
+    When a harness stops a capture it often closes the pipe that held
+    diaggulp's stderr. The next teardown ``print`` then raises
+    ``BrokenPipeError`` and every disarm after it is skipped, leaving the log,
+    event and QSH planes armed. The teardown's messages are worth losing; the
+    disarms are not.
+    """
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+
+    def write(self, s):
+        try:
+            return self._stream.write(s)
+        except (OSError, ValueError):
+            return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _shield_teardown(deferred: list) -> dict:
+    """Make the capture teardown run to the end.
+
+    The first SIGTERM/SIGINT ends the read loop as ``KeyboardInterrupt``. A
+    second one, which a supervisor sends when the process is slow to exit,
+    used to raise again inside the ``finally:`` and abort whatever disarm was
+    running: measured on an M3100, where the F3 restore printed but log, events
+    and QSH were left armed (8.5 MB in 6 s to nobody). From here on, a stop
+    signal is recorded in ``deferred`` and otherwise ignored, because the
+    teardown is already the stop. SIGKILL cannot be caught; ``timeout -k``
+    still has the last word. Returns the handlers it replaced, for the caller
+    to put back once the teardown is over.
+    """
+    def _defer(signum, frame):
+        deferred.append(signum)
+    replaced = {}
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        if signal.getsignal(sig) is not signal.SIG_IGN:
+            replaced[sig] = signal.signal(sig, _defer)
+    if not isinstance(sys.stderr, _TolerantStream):
+        sys.stderr = _TolerantStream(sys.stderr)
+    return replaced
 
 
 def slurp(
@@ -3085,7 +3405,7 @@ def iter_udp_payloads(path: str, port: Optional[int] = None, *,
     ``scratch_dir`` chooses where a ``.zst`` input is transiently decompressed.
     ``None`` (the default) keeps the historical behavior — the OS temp dir, which
     on several hosts is tmpfs and can OOM on a large decompress. The
-    pcap-native streaming source (:func:`diaggrok.diag_source.open_diag_source`)
+    pcap-native streaming source (:func:`diagmunge.diag_source.open_diag_source`)
     passes the sanctioned repo scratch dir so parts decompress one-at-a-time onto
     real disk; each temp is deleted as soon as its part is streamed.
 
@@ -3106,15 +3426,17 @@ def iter_udp_payloads(path: str, port: Optional[int] = None, *,
 
 
 def pcap_replay_available() -> bool:
-    """True when the pcap replay core (``diaggrok.diag_source``) is importable.
+    """True when the pcap replay core (``diagmunge.diag_source``) is importable.
 
-    That module imports diagmunge, so it cannot ship in diaggrok, whose edge
-    to diagmunge runs the other way; a diaggrok without it has no ``--pcap``
-    replay. ``main`` checks this before opening any output.
+    It ships with diagmunge and needs diaggrok's HDLC framer, so an install
+    that predates it, or that lacks diaggrok, has no ``--pcap`` replay.
+    ``main`` checks this before opening any output.
     """
     try:
-        return importlib.util.find_spec("diaggrok.diag_source") is not None
-    except ModuleNotFoundError:     # diaggrok itself is absent
+        # find_spec does not import the module, so check its diaggrok dep too.
+        return (importlib.util.find_spec("diagmunge.diag_source") is not None
+                and importlib.util.find_spec("diaggrok.hdlc") is not None)
+    except ModuleNotFoundError:     # diagmunge or diaggrok itself is absent
         return False
 
 
@@ -3130,14 +3452,14 @@ def replay_pcap_dge1(source, port: Optional[int], out_fd: int) -> "tuple[int, di
     reassembles and the gap report is contiguous across the seam. **No merged
     pcap** — the parts feed the carve directly.
 
-    The deframe is the shared :func:`diaggrok.diag_source.iter_dge1_payloads`
+    The deframe is the shared :func:`diagmunge.diag_source.iter_dge1_payloads`
     core (also driving the F3/scan pcap paths), so the carve's late/dup-drop and
     gap accounting cannot drift from those paths. That core sniffs the
     container by magic and decompresses ``.zst`` parts one-at-a-time into
     sanctioned scratch, so a ``.pcapng[.zst]`` master carves natively — the
     format this whole effort produces.
     """
-    from diaggrok.diag_source import iter_dge1_payloads  # lazy: avoids import cycle
+    from diagmunge.diag_source import iter_dge1_payloads  # lazy: avoids import cycle
 
     bytes_written = 0
     gen = iter_dge1_payloads(source, port=port)
@@ -3168,9 +3490,10 @@ def _run_pcap_transport(args, explicit_port: bool) -> int:
               file=sys.stderr)
         return 2
     if not pcap_replay_available():
-        print("error: --pcap replay needs diaggrok.diag_source, which this "
-              "diaggrok install does not provide; capture live with "
-              "--transport udp-listen instead", file=sys.stderr)
+        print("error: --pcap replay needs diagmunge.diag_source (diagmunge "
+              "with the decode extra, i.e. diaggrok installed); upgrade "
+              "diagmunge or capture live with --transport udp-listen instead",
+              file=sys.stderr)
         return 2
     # The diagbarf broadcast lands on UDP 12399; default the filter to that
     # unless the user explicitly set --port (which globally defaults to 2500).
@@ -3661,8 +3984,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "(RM500Q-AE, T99W175, RM520N-GL, T99W640; SDX55/62/72) "
              "and reaches SSIDs above 110 that --qsh-sweep cannot; a maskset "
              "measured on your own modem (--qsh-pairs-file) fits it best. "
-             "There is deliberately no 'gnss' "
-             "profile: 0x9D carries no location trace. WARNING the "
+             "There is no 'gnss' profile: 0x9D carries no GNSS-engine "
+             "trace, only GNSS on/off and RF power state on MPOWER bit 4 / RF "
+             "bit 2, which golden lacks; arm those with qsh_trace_arm.py "
+             "--gnss-state. WARNING the "
              "modem-side maskset is STICKY across DIAG session teardown, so a "
              "--no-qsh-trace run inherits the last arm. A new SET REPLACES the "
              "armed maskset rather than adding to it (measured on SDX55, "
@@ -3764,6 +4089,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "armed. Hex (0x...) or decimal.",
     )
     parser.add_argument(
+        "--disarm-logs-on-exit", action="store_true",
+        help="On exit, clear the binary log mask (LOG_CONFIG op 0) and event "
+             "reporting (0x60 00), then verify on the stream that 0x10 and 0x60 "
+             "stopped. Both are modem-side sticky and have no GET, so "
+             "they are cleared, not restored. Left armed, the port keeps "
+             "streaming to nobody (~600 KB/s on a MiFi 6620L) and floods every "
+             "later reader. Opt-in, like the two flags below; for a one-shot "
+             "capture use all three.",
+    )
+    parser.add_argument(
         "--disarm-qsh-on-exit", action="store_true",
         help="On exit, disarm the QSH-trace 0x9001 maskset (empty count=0 SET) "
              "if THIS run armed it, then verify on the stream that 0x9D stopped "
@@ -3807,6 +4142,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--mask-retry-delay", type=float, default=5.0,
         help="Seconds to sleep before each mask handshake retry (default 5.0). "
              "Tuned to let the modem settle after USB re-enumeration / cold boot.",
+    )
+    parser.add_argument(
+        "--wait-ready", type=float, default=0.0, metavar="SECONDS",
+        help="Serial only: open the port and probe DIAG_VERNO_F, reopening with "
+             "backoff on a transport error or no reply, for up to SECONDS before "
+             "the first real request (default 0 = off). For a capture started "
+             "right after a modem (re)enumerates, where the tty exists before "
+             "the DIAG function answers. A modem that never answers "
+             "VERNO (LM960A18, telit-quirk path) cannot use it.",
     )
     quirk_group = parser.add_mutually_exclusive_group()
     quirk_group.add_argument(
@@ -4223,7 +4567,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                       "(no running qcseriald-darwin DIAG port found on macOS)",
                       file=sys.stderr)
                 return 2
-        client = DiagClient.from_serial(args.device, args.baud)
+        if args.wait_ready > 0:
+            client = _wait_diag_ready(
+                lambda: DiagClient.from_serial(args.device, args.baud),
+                args.wait_ready)
+            if client is None:
+                return 1
+        else:
+            client = DiagClient.from_serial(args.device, args.baud)
     elif args.transport == "tcp":
         client = DiagClient.from_tcp_server(args.host, args.port)
     elif args.transport == "udp":
@@ -4506,30 +4857,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, _sig_handler)
     signal.signal(signal.SIGINT, _sig_handler)
+    # A dropped controlling shell (harness TaskStop) is a stop too, so it must
+    # reach the disarming teardown rather than kill outright. A run
+    # under nohup has SIGHUP ignored on purpose; leave that alone.
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, _sig_handler)
 
     # --- Anchor-frame eligibility check ---
-    # We only emit anchors for non-rotating, non-stdout captures. Rotating
-    # captures span multiple files with their own time bases, and stdout
-    # capture has no place to put the sidecar; both are deferred to a
-    # follow-up if the need arises.
+    # Anchors need a sidecar location, so stdout capture has none. A rotating
+    # capture anchors every segment: VERNO at the run's two ends, and a
+    # rotation_boundary anchor at each cut, which ends one segment and starts
+    # the next. All segments share the modem's one DIAG time base.
     anchor_enabled = (
         args.anchor_frame == "boundary"
         and resolved_output_path is not None
-        and writer is None
     )
     if args.anchor_frame == "boundary" and not anchor_enabled:
-        if resolved_output_path is None:
-            print(
-                "warning: --anchor-frame=boundary requires --output (stdout "
-                "capture has no sidecar location); skipping anchor emission",
-                file=sys.stderr,
-            )
-        elif writer is not None:
-            print(
-                "warning: --anchor-frame=boundary not yet supported with "
-                "--rotate-size / --rotate-interval; skipping anchor emission",
-                file=sys.stderr,
-            )
+        print(
+            "warning: --anchor-frame=boundary requires --output (stdout "
+            "capture has no sidecar location); skipping anchor emission",
+            file=sys.stderr,
+        )
     # Say it once, plainly, BEFORE a byte is banked. The three
     # branches above each explain their own cause, and --anchor-frame=none
     # explains nothing at all; none of them state the consequence. An operator
@@ -4558,7 +4906,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # but independent of --anchor-frame: an operator who wants no clock anchor
     # still gets the PD table unless they say --no-diag-id-binding.
     binding_record: Optional[dict] = None
-    if args.diag_id_binding and resolved_output_path is not None and writer is None:
+    if args.diag_id_binding and resolved_output_path is not None:
         binding_record = _request_diag_id_binding(
             client, timeout=args.anchor_timeout, quiet=args.quiet,
             telit_quirk=bool(args.telit_quirk),
@@ -4655,8 +5003,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             from diagmunge.munge.dlf_to_pcap import PcapSink, _open_outputs
             from diagmunge.gsmtap import pcap_eligible_codes
             _pcap_out = Path(args.pcap_out)
-            writer, nr_writer, _pcap_files, _pcap_nr_path = _open_outputs(_pcap_out)
-            _pcap_sink = PcapSink(writer, nr_writer=nr_writer)
+            # Distinct names: ``writer`` is the rotating-capture writer.
+            pcap_writer, nr_writer, _pcap_files, _pcap_nr_path = _open_outputs(_pcap_out)
+            _pcap_sink = PcapSink(pcap_writer, nr_writer=nr_writer)
             # Broaden the decode filter to include pcap-eligible codes so they
             # reach the sink; a code with no encoder is simply skip-tallied.
             pe = set(pcap_eligible_codes())
@@ -4682,8 +5031,46 @@ def main(argv: Optional[list[str]] = None) -> int:
                   f"(raw .bin unaffected)", file=sys.stderr)
     tee_fn = live_decoder.feed if live_decoder is not None else None
 
+    # --- Per-segment anchor sidecars for a rotating capture ---
+    # One {"path", "start"} per segment. A closed segment's sidecar is written
+    # at the rotation, so a later kill -9 still leaves every closed segment
+    # anchored; the open one is written at teardown with the post-anchor. The
+    # run-level records (QSHRINK4 binding, event mask) go to segment 0 only.
+    segments: list[dict] = []
+
+    def _segment_sidecar_doc(index: int, start, end) -> "Optional[dict]":
+        binding = binding_record if index == 0 else None
+        events = event_mask_record if index == 0 else None
+        if not ((anchor_enabled and (start is not None or end is not None))
+                or binding is not None or events is not None):
+            return None
+        doc = _anchor_sidecar_doc(start if anchor_enabled else None,
+                                  end if anchor_enabled else None,
+                                  diag_id_binding=binding, event_mask=events)
+        if writer is not None:
+            seg = segments[index]
+            doc["segment"] = {"index": index, "prev": seg.get("prev"),
+                              "next": seg.get("next")}
+        return doc
+
+    if writer is not None:
+        segments.append({"path": resolved_output_path, "start": pre_anchor})
+
+        def _on_rotate(closed_path, new_path, mono_ns, unix_ns):
+            boundary = _rotation_boundary_anchor(mono_ns, unix_ns)
+            index = len(segments) - 1
+            segments[index]["next"] = os.path.basename(new_path)
+            doc = _segment_sidecar_doc(index, segments[index]["start"], boundary)
+            if doc is not None:
+                _write_anchor_sidecar(closed_path, doc, quiet=args.quiet)
+            segments.append({"path": new_path, "start": boundary,
+                             "prev": os.path.basename(closed_path)})
+
+        writer.on_rotate = _on_rotate
+
     # --- The hot loop ---
     stop_info: dict = {}   # records WHY the capture loop stopped
+    _deferred_signals: list[int] = []   # signals that arrived during teardown
     try:
         if writer is not None:
             # Rotating: must go through writer.write() so the rotation check
@@ -4703,6 +5090,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 stop_info=stop_info,
             )
     finally:
+        # The disarms below are the only thing standing between the modem and
+        # a port streaming to nobody, so nothing may cut them short.
+        _stderr_before_teardown = sys.stderr
+        _handlers_before_teardown = _shield_teardown(_deferred_signals)
         # --- Stop live decode side-thread + close its sink ---
         if live_decoder is not None:
             live_decoder.stop()
@@ -4776,6 +5167,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                         file=sys.stderr,
                     )
 
+        # --- Opt-in log-mask + event-reporting disarm ---
+        # Last, so the F3 / QSH windows above still see whatever they measure.
+        # Opt-in for the same reason as both of those.
+        if getattr(args, "disarm_logs_on_exit", False):
+            if passive:
+                print(
+                    "diaggulp: --disarm-logs-on-exit ignored on passive transport "
+                    f"{args.transport} (no writable command path)",
+                    file=sys.stderr,
+                )
+            else:
+                _disarm_logs_and_events(client, telit_quirk=bool(args.telit_quirk))
+
         if writer is not None:
             writer.close()
         elif args.output:
@@ -4831,33 +5235,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                     file=sys.stderr,
                 )
 
-        # --- Write anchor sidecar ---
-        if resolved_output_path is not None and (
-            (anchor_enabled and (pre_anchor is not None or post_anchor is not None))
-            or binding_record is not None
-            or event_mask_record is not None
-        ):
-            sidecar_path = resolved_output_path + ".anchors.json"
-            sidecar = _anchor_sidecar_doc(pre_anchor, post_anchor,
-                                          diag_id_binding=binding_record,
-                                          event_mask=event_mask_record)
-            anchors_list = sidecar["anchors"]
-            try:
-                with open(sidecar_path, "w", encoding="utf-8") as fh:
-                    json.dump(sidecar, fh, indent=2)
-                    fh.write("\n")
-                if not args.quiet:
-                    print(
-                        f"diaggulp: wrote anchor sidecar {sidecar_path} "
-                        f"({len(anchors_list)} anchor(s))",
-                        file=sys.stderr,
-                    )
-            except OSError as exc:
-                print(
-                    f"warning: failed to write anchor sidecar "
-                    f"{sidecar_path}: {exc}",
-                    file=sys.stderr,
-                )
+        # --- Write anchor sidecar, one per segment ---
+        # A rotating capture's closed segments were written at each rotation;
+        # this writes the open (last) one, which ends at the post-anchor.
+        if resolved_output_path is not None:
+            if segments:
+                last = len(segments) - 1
+                final_path = segments[last]["path"]
+                sidecar = _segment_sidecar_doc(last, segments[last]["start"], post_anchor)
+            else:
+                final_path = resolved_output_path
+                sidecar = _segment_sidecar_doc(0, pre_anchor, post_anchor)
+            if sidecar is not None:
+                _write_anchor_sidecar(final_path, sidecar, quiet=args.quiet)
+
+        if _deferred_signals:
+            print(f"diaggulp: {len(_deferred_signals)} stop signal(s) arrived "
+                  f"during teardown and were held until the disarms finished "
+                  f"", file=sys.stderr)
+        sys.stderr = _stderr_before_teardown
+        for _sig, _handler in _handlers_before_teardown.items():
+            signal.signal(_sig, _handler)
 
     if not args.quiet:
         rate = bytes_written / elapsed if elapsed > 0 else 0.0

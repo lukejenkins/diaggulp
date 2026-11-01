@@ -22,15 +22,21 @@ diaggulp is built to **compose** with them, not compete.
 
 ## Install
 
+diaggulp is not on PyPI; install it from GitHub at a release tag:
+
 ```
-pip install diaggulp            # capture only
-pip install diaggulp[serial]    # + live USB-serial capture support
-pip install diaggulp[decode]    # + inline --decode and --pcap-out (GSMTAP pcap)
+pip install "diaggulp @ git+https://github.com/lukejenkins/diaggulp@v2026.10.31"
+pip install "diaggulp[serial] @ git+https://github.com/lukejenkins/diaggulp@v2026.10.31"   # + live USB-serial capture
+pip install "diaggulp[decode] @ git+https://github.com/lukejenkins/diaggulp@v2026.10.31"   # + --decode, --pcap-out, --pcap replay
 ```
 
-The base install is stdlib-only on the capture path; the `serial` and
-`decode` extras pull their requirements lazily, so a plain capture pays for
-neither.
+The base install needs `diagmunge` (the DIAG transport) and `zstandard`; it
+pulls `diagmunge` at the tag it pins. The `serial` and `decode` extras add
+`pyserial` and `diaggrok`, imported only when used. `--pcap` replay of a
+capture file needs the `decode` extra, for diaggrok's HDLC framer. Install
+diaggulp on its own rather than in the same command as a different diagmunge
+or diaggrok reference: pip resolves git URLs by string, so two references to
+the same library conflict even when they name the same commit.
 
 ## Usage
 

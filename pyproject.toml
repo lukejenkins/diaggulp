@@ -14,7 +14,7 @@ requires-python = ">=3.11"
 # zstandard: diaggulp.py imports it at module scope (the .zst container
 # reader), so it is a hard dependency, not an extra.
 dependencies = [
-    "diagmunge @ git+https://github.com/lukejenkins/diagmunge@v2026.10.13",
+    "diagmunge @ git+https://github.com/lukejenkins/diagmunge@v2026.10.31",
     "zstandard",
 ]
 
@@ -28,7 +28,7 @@ serial = ["pyserial"]
 # `pip install diaggulp[decode]` wires the published decoder.
 # git-pinned for the same reason as diagmunge — diaggrok is public but not yet
 # on PyPI. Repoint to `diaggrok>=X.Y` once it is published.
-decode = ["diaggrok @ git+https://github.com/lukejenkins/diaggrok@v2026.10.12"]
+decode = ["diaggrok @ git+https://github.com/lukejenkins/diaggrok@v2026.10.31"]
 
 [project.scripts]
 diaggulp = "diaggulp:main"

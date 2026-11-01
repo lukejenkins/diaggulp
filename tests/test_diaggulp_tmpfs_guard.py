@@ -44,6 +44,10 @@ def test_disk_path_is_not_flagged_as_tmpfs():
     # guard must not fire for a capture written next to the source tree.
     fstype = d._path_filesystem_type(str(Path(__file__).resolve().parent))
     assert fstype is not None
+    if fstype in ("tmpfs", "ramfs"):
+        # A checkout under a tmpfs /tmp (common in CI): the guard is right to
+        # flag it, and there is no disk path here to check the negative on.
+        pytest.skip(f"this checkout is itself on {fstype}")
     assert fstype not in ("tmpfs", "ramfs")
 
 

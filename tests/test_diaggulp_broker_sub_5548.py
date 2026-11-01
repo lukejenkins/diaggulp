@@ -99,7 +99,8 @@ def test_main_hands_the_declaration_to_the_transport(monkeypatch, tmp_path):
     monkeypatch.setattr(d.DiagClient, "from_tcp_client", fake)
     with pytest.raises(_Opened):
         d.main(["--transport", "tcp-connect", "--host", "127.0.0.1", "--port", "2700",
-                "--broker-sub", '{"floor":"max"}', "-o", str(tmp_path / "x.bin")])
+                "--broker-sub", '{"floor":"max"}', "-o", str(tmp_path / "x.bin"),
+                "--no-disk-check"])
     assert seen == {"host": "127.0.0.1", "port": 2700,
                     "broker_sub": {"name": "diaggulp", "floor": "max"}}
 
@@ -109,6 +110,7 @@ def test_a_refused_subscription_exits_2_with_the_reason(monkeypatch, capsys, tmp
         raise BrokerError("broker refused the subscription: unknown preset 'x'")
     monkeypatch.setattr(d.DiagClient, "from_tcp_client", fake)
     rc = d.main(["--transport", "tcp-connect", "--host", "127.0.0.1", "--port", "2700",
-                 "--broker-sub", '{"floor":"x"}', "-o", str(tmp_path / "x.bin")])
+                 "--broker-sub", '{"floor":"x"}', "-o", str(tmp_path / "x.bin"),
+                 "--no-disk-check"])
     assert rc == 2
     assert "unknown preset" in capsys.readouterr().err

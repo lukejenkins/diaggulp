@@ -19,18 +19,21 @@ from unittest.mock import MagicMock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
-sys.modules.setdefault("serial", MagicMock())
+try:
+    import serial  # noqa: F401  # real pyserial is in .venv
+except ImportError:
+    sys.modules["serial"] = MagicMock()
 
 import diaggulp  # noqa: E402
 from diagmunge import Dge1SeqTracker, parse_dge1_header  # noqa: E402
 
 import pytest  # noqa: E402
 
-# The pcap replay core lives in diaggrok.diag_source, which a public diaggrok
-# does not ship (it imports diagmunge). Without it --pcap refuses cleanly.
+# The pcap replay core is diagmunge.diag_source, which needs diaggrok's HDLC
+# framer. An install without either refuses --pcap cleanly.
 needs_pcap_replay = pytest.mark.skipif(
     not diaggulp.pcap_replay_available(),
-    reason="diaggrok.diag_source absent: no --pcap replay in this install")
+    reason="diagmunge.diag_source absent: no --pcap replay in this install")
 
 
 # --- synthetic frame builders -------------------------------------------------
@@ -400,6 +403,41 @@ def test_main_pcap_writes_dlf_and_sidecar():
     assert sidecar["received"] == 2 and sidecar["missing"] == 0
 
 
+def test_main_live_pcap_out_does_not_clobber_the_capture_writer():
+    """--pcap-out must not rebind main()'s rotating-capture ``writer``.
+
+    The pcap sink once unpacked into ``writer``, so a plain (non-rotating)
+    live capture took the slurp_rotating path and called PcapWriter.write()
+    (AttributeError, 0-byte capture) — hit on the EM061K-GL uecap run.
+    Driven through the real live loop via udp-listen on loopback.
+    """
+    import socket
+    import threading
+    import time
+    pytest.importorskip("diagmunge.munge.dlf_to_pcap")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    payloads = [b"\x7e\xAA\xBB", b"\x7e\xCC"]
+
+    def _send():
+        time.sleep(0.5)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tx:
+            for i, pl in enumerate(payloads, start=1):
+                tx.sendto(dge1(i, pl), ("127.0.0.1", port))
+    threading.Thread(target=_send, daemon=True).start()
+
+    out = tempfile.mktemp(suffix=".dlf")
+    pcap_out = tempfile.mktemp(suffix=".pcap")
+    rc = diaggulp.main(["--transport", "udp-listen", "--host", "127.0.0.1",
+                        "--port", str(port), "--no-mask", "--seconds", "2",
+                        "-o", out, "--pcap-out", pcap_out, "--quiet",
+                        "--no-disk-check"])
+    assert rc == 0
+    assert Path(out).read_bytes() == b"".join(payloads)
+    assert Path(pcap_out).exists()
+
+
 @needs_pcap_replay
 def test_main_pcap_explicit_port_override():
     frames = [eth_ipv4_udp(2500, dge1(1, b"\x7e\x42"))]
@@ -436,6 +474,7 @@ def test_main_pcap_replay_is_exempt_from_the_free_space_floor():
     assert Path(out).read_bytes() == b"\x7e\x42"
 
 
+@pytest.mark.diaggulp_real_disk
 def test_main_live_transport_still_honours_the_free_space_floor():
     """Positive control for the exemption above: a LIVE transport must still be
     refused below the floor. A fix that simply weakened the guard would pass the
@@ -457,11 +496,22 @@ def test_main_pcap_requires_pcap_arg():
     assert rc == 2
 
 
+def test_replay_is_unavailable_when_diaggrok_is_missing(monkeypatch):
+    """diagmunge.diag_source is findable without importing it, so a diagmunge
+    without diaggrok must not report --pcap as available: the import would fail
+    at replay time instead of being refused up front."""
+    import importlib.util
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec",
+                        lambda name, *a: None if name == "diaggrok.hdlc" else real(name, *a))
+    assert diaggulp.pcap_replay_available() is False
+
+
 def test_main_pcap_refuses_cleanly_without_the_replay_core(monkeypatch, capsys):
     monkeypatch.setattr(diaggulp, "pcap_replay_available", lambda: False)
     pcap = _write_tmp(make_pcap([eth_ipv4_udp(12399, dge1(1, b"\x7e\x42"))]))
     out = tempfile.mktemp(suffix=".dlf")
     rc = diaggulp.main(["--transport", "pcap", "--pcap", pcap, "-o", out, "--quiet"])
     assert rc == 2
-    assert "diaggrok.diag_source" in capsys.readouterr().err
+    assert "diagmunge.diag_source" in capsys.readouterr().err
     assert not Path(out).exists(), "a refusal must not leave an output file behind"

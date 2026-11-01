@@ -19,7 +19,10 @@ from unittest.mock import MagicMock, patch
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
-sys.modules.setdefault("serial", MagicMock())
+try:
+    import serial  # noqa: F401  # real pyserial is in .venv
+except ImportError:
+    sys.modules["serial"] = MagicMock()
 
 import diaggulp  # noqa: E402
 

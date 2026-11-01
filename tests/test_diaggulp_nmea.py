@@ -10,7 +10,10 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 # diaggulp's serial reader imports pyserial lazily — stub it so the import
 # succeeds headless (mirrors tests/test_diaggulp.py).
-sys.modules.setdefault("serial", MagicMock())
+try:
+    import serial  # noqa: F401  # real pyserial is in .venv
+except ImportError:
+    sys.modules["serial"] = MagicMock()
 
 import pytest
 from diaggulp import (
