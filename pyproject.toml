@@ -1,20 +1,37 @@
 [project]
 name = "diaggulp"
-version = "0.1.0"
+version = "2026.11.8"
 description = "Low-CPU host-side Qualcomm DIAG capture — arms the log mask and pumps raw HDLC"
 license = "Apache-2.0"
 requires-python = ">=3.11"
+readme = "README.md"
+authors = [{ name = "Luke Jenkins" }]
+keywords = ["diag", "modem", "cellular", "baseband", "lte", "5g"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Telecommunications Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Communications",
+    "Topic :: System :: Hardware",
+]
 # Hard, import-time dependency: the DIAG transport core (DiagClient + DGE1
 # helpers), imported at module scope (diaggulp.py:108 `from diagmunge import …`).
 # Inward-only edge: diaggulp -> diagmunge -> diaggrok. Never the reverse.
-# diagmunge is not on PyPI yet, so a bare name would not resolve: it comes from
-# the public git remote, pinned to the release tag this package's suite was
-# verified against. Bump it with each re-verify; repoint to `diagmunge>=X.Y`
-# once it is published.
+# A bare PyPI name with a floor at the diagmunge release this package's suite
+# was verified against; PyPI rejects direct-URL deps. Release order:
+# diaggrok, then diagmunge, must be on PyPI before this package is uploaded.
 # zstandard: diaggulp.py imports it at module scope (the .zst container
 # reader), so it is a hard dependency, not an extra.
 dependencies = [
-    "diagmunge @ git+https://github.com/lukejenkins/diagmunge@v2026.10.31",
+    "diagmunge>=2026.11.8",
     "zstandard",
 ]
 
@@ -26,9 +43,8 @@ serial = ["pyserial"]
 # Inline `--decode` imports diaggrok lazily (diaggulp.py:1256-1257). Bare
 # `pip install diaggulp` gives capture with zero diaggrok on the wheel;
 # `pip install diaggulp[decode]` wires the published decoder.
-# git-pinned for the same reason as diagmunge — diaggrok is public but not yet
-# on PyPI. Repoint to `diaggrok>=X.Y` once it is published.
-decode = ["diaggrok @ git+https://github.com/lukejenkins/diaggrok@v2026.10.31"]
+# Floored at the verified diaggrok release, as for diagmunge above.
+decode = ["diaggrok>=2026.11.8"]
 
 [project.scripts]
 diaggulp = "diaggulp:main"
@@ -41,8 +57,13 @@ markers = [
     "decode: exercises the optional diaggrok `--decode` path (needs diaggulp[decode])",
 ]
 
+[project.urls]
+Homepage = "https://github.com/lukejenkins/diaggulp"
+Source = "https://github.com/lukejenkins/diaggulp"
+Changelog = "https://github.com/lukejenkins/diaggulp/releases"
+
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 # Single-module package: `diaggulp.py` sits at the repo root beside this file.

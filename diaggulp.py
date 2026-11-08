@@ -96,7 +96,10 @@ signal. SIGHUP (a dropped controlling shell) is wired the same way unless the
 run was started under ``nohup``. Once the teardown has started, further stop
 signals are held and a closed stderr pipe is ignored, so an impatient
 supervisor cannot cut the ``--disarm-*-on-exit`` / ``--restore-f3-mask-on-exit``
-steps short. Only SIGKILL can. To clear a modem that was left armed,
+steps short. Only SIGKILL can. A stop that arrives earlier, while the
+masks are being armed or the capture is being set up, is held until setup
+ends. The read loop is then skipped and the same teardown runs, so the run
+exits 0 having captured nothing. To clear a modem that was left armed,
 run a brief quiesce: ``diaggulp ... -o /dev/null --disarm-logs-on-exit`` (add
 the other ``-on-exit`` flags for whatever else was armed).
 
@@ -513,14 +516,14 @@ def _all_logs_mask_bytes(bitsize: int) -> bytes:
 
 
 # Vendor SPC bodies to try, in order, when --spc auto is requested. The EG25/EC25
-# MDM9607 family gates LOG_CONFIG (0x73) behind an SPC unlock (opcode 0x46) and
-# rejects the mask handshake with DIAG_BAD_CMD_F until unlocked. The
+# MDM9607 family was reported to gate LOG_CONFIG (0x73) behind an SPC;
+# the gate did not reproduce on two EG25-G builds. DIAG_SPC_F is 0x41. The
 # Quectel reference 000000 first, then the Telit-form 0000.
 _SPC_AUTO = ["000000", "0000"]
 
 
 def _try_spc_unlock(client: DiagClient, spc_arg: str) -> bool:
-    """Send a DIAG SPC unlock (opcode 0x46) before the LOG_CONFIG handshake.
+    """Send a DIAG SPC (DIAG_SPC_F, 0x41) before the LOG_CONFIG handshake.
 
     ``spc_arg == "auto"`` tries the known vendor codes in :data:`_SPC_AUTO` in
     order, stopping at the first accepted (``status==1``); any other value is
@@ -1957,15 +1960,23 @@ def _telit_kick_payload() -> bytes:
     return pack("<3xI", _LOG_CFG_RETRIEVE_RANGES)
 
 
-def _telit_logconfig_reply_matches(opcode: int, body: bytes, operation: int) -> bool:
+def _telit_logconfig_reply_matches(
+    opcode: int, body: bytes, operation: int, log_type: "Optional[int]" = None,
+) -> bool:
     """Pure predicate: is ``(opcode, body)`` a DIAG_LOG_CONFIG_F reply for
     ``operation``? Discriminates by the body ``operation`` u32 (offset 4, after
     3 pad bytes) so a one-behind aliased reply for a *different* sub-operation
-    is rejected instead of bound."""
+    is rejected instead of bound. With ``log_type`` (SET_MASK), the
+    reply's log type (``3x op status log_type``, offset 11) must match too, so
+    one group's ack is never bound to another's."""
     from struct import unpack_from
     if opcode != _DIAG_LOG_CONFIG_F or len(body) < 8:
         return False
-    return unpack_from("<3xI", body)[0] == operation
+    if unpack_from("<3xI", body)[0] != operation:
+        return False
+    if log_type is None:
+        return True
+    return len(body) >= 15 and unpack_from("<3xIII", body)[2] == log_type
 
 
 def _telit_drain_bounded(
@@ -2070,11 +2081,18 @@ def _telit_write_pumped(
     *,
     chunk: int = 48,
     drain_each: float = 0.03,
-) -> None:
+) -> "list[tuple[int, bytes, int]]":
     """Write one HDLC frame in ``chunk``-byte slices, draining IN between
     slices, so a large OUT never wedges behind a full modem IN buffer (the
-    duplex deadlock). Frames drained here are discarded; the caller's
-    kick loop re-provokes the real reply. Serial transport only."""
+    duplex deadlock). Serial transport only.
+
+    Returns the ``(opcode, body, monotonic_ns_at_read)`` frames read between
+    slices. The reply to
+    THIS command is usually among them: the modem flushes IN when the host
+    writes OUT, so the final slice provokes it. On an LM960A18 (32.01.110)
+    every SET_MASK ack arrived here, ~0.2 s after the write. Discarding them
+    made each SET_MASK wait out its 4 s timeout and read as "no ack"."""
+    drained: "list[tuple[int, bytes, int]]" = []
     frame = client._hdlc_encapsulate(bytes([opcode]) + payload)
     transport = client._transport
     for i in range(0, len(frame), chunk):
@@ -2100,9 +2118,11 @@ def _telit_write_pumped(
             if remaining <= 0:
                 break
             try:
-                client.recv(timeout=remaining)
+                opcode, body = client.recv(timeout=remaining)
+                drained.append((opcode, body, time.monotonic_ns()))
             except TimeoutError:
                 break
+    return drained
 
 
 def _telit_log_config_xact(
@@ -2112,6 +2132,7 @@ def _telit_log_config_xact(
     *,
     timeout: float = 4.0,
     kick_every: float = 0.4,
+    log_type: "Optional[int]" = None,
 ) -> "Optional[bytes]":
     """One DIAG_LOG_CONFIG_F transaction over the flush-on-OUT modem.
 
@@ -2119,8 +2140,11 @@ def _telit_log_config_xact(
     ``kick_every`` seconds until a reply whose body operation matches
     ``operation`` arrives (operation-field correlation discards the kicks' own
     RETRIEVE_RANGES replies and any aliased prior-operation reply). Returns the
-    matching reply body, or ``None`` on timeout."""
-    _telit_write_pumped(client, _DIAG_LOG_CONFIG_F, payload)
+    matching reply body, or ``None`` on timeout. A reply already read while the
+    command was being written counts."""
+    for opcode, body, _ in _telit_write_pumped(client, _DIAG_LOG_CONFIG_F, payload):
+        if _telit_logconfig_reply_matches(opcode, body, operation, log_type):
+            return body
     kick = _telit_kick_payload()
     deadline = time.monotonic() + timeout
     next_kick = time.monotonic() + kick_every
@@ -2141,7 +2165,7 @@ def _telit_log_config_xact(
             opcode, body = client.recv(timeout=min(kick_every, max(0.01, deadline - now)))
         except TimeoutError:
             continue
-        if _telit_logconfig_reply_matches(opcode, body, operation):
+        if _telit_logconfig_reply_matches(opcode, body, operation, log_type):
             return body
 
 
@@ -2172,6 +2196,12 @@ def _telit_retrieve_ranges(client: DiagClient) -> "tuple[int, ...]":
 def _telit_set_mask(client: DiagClient, log_type: int, bitsize: int, mask: bytes) -> None:
     """SET_MASK for one log type over the telit-quirk transaction.
 
+    ✅ **The LM960A18 (32.01.110) does ack every SET_MASK**: the ack
+    arrives ~0.2 s after the write, during the pumped write's drain, which used
+    to discard it. Each group then waited out the 4 s timeout, ~28 s per start.
+    The drained frames are now checked first. The tolerance below stays for any
+    part that really does not ack.
+
     Fire-and-forget tolerant — on LM960 32.01.110 / SDX20, some flush-on-OUT Telit firmwares APPLY the SET_MASK
     but never emit a LOG_CONFIG SET_MASK reply the operation-correlator can
     match — the mask still takes effect (proven by the subscribed codes then
@@ -2186,6 +2216,7 @@ def _telit_set_mask(client: DiagClient, log_type: int, bitsize: int, mask: bytes
     body = _telit_log_config_xact(
         client, _LOG_CFG_SET_MASK,
         pack("<3xIII", _LOG_CFG_SET_MASK, log_type, bitsize) + mask,
+        log_type=log_type,
     )
     if body is None:
         print(
@@ -2216,7 +2247,14 @@ def _telit_version_anchor(
     ``None`` if the firmware genuinely never answers — the caller then falls
     back to :func:`_host_bracket_anchor`.
 
-    ⚠️ **Hardware verdict on the motivating part: the LM960A18 never answers,
+    ✅ **Corrected: the LM960A18 DOES answer.** Its reply was read
+    during the pumped write's between-slice drain and thrown away; the drained
+    frames are now checked first, and on 32.01.110 the anchor came back with a
+    1.4 ms RTT (``method=diag_verno_response``). The earlier verdict below
+    scanned only the capture FILE, which never sees handshake-phase reads, so
+    "never on the wire" was not measured. Kept for the record:
+
+    ⚠️ *(superseded)* **Hardware verdict on the motivating part: the LM960A18 never answers,
     and the flush-on-OUT theory does NOT explain why**. Firmware
     32.01.1X0. A 50 s live capture ran both boundaries over this
     pumped path; both returned ``None`` and fell back to ``host_bracket``, and
@@ -2236,11 +2274,24 @@ def _telit_version_anchor(
     answer over it. Do not "simplify" it back to a plain exchange on the
     strength of this one part's result.
     """
+    def _anchor(body: bytes, recv_ns: int) -> dict:
+        return {
+            "opcode": DIAG_VERNO_F,
+            "host_mono_ns": host_mono_ns,
+            "host_mono_recv_ns": recv_ns,
+            "response_bytes_hex": body.hex(),
+            "rtt_ns": recv_ns - host_mono_ns,
+        }
+
     host_mono_ns = time.monotonic_ns()
     try:
-        _telit_write_pumped(client, DIAG_VERNO_F, b"")
+        drained = _telit_write_pumped(client, DIAG_VERNO_F, b"")
     except (OSError, RuntimeError):
         return None
+    # The reply is usually read during the pumped write itself.
+    for opcode, body, recv_ns in drained:
+        if opcode == DIAG_VERNO_F:
+            return _anchor(body, recv_ns)
     kick = _telit_kick_payload()
     deadline = time.monotonic() + timeout
     next_kick = time.monotonic() + kick_every
@@ -2261,21 +2312,15 @@ def _telit_version_anchor(
         except TimeoutError:
             continue
         if opcode == DIAG_VERNO_F:
-            host_mono_recv_ns = time.monotonic_ns()
-            return {
-                "opcode": DIAG_VERNO_F,
-                "host_mono_ns": host_mono_ns,
-                "host_mono_recv_ns": host_mono_recv_ns,
-                "response_bytes_hex": body.hex(),
-                "rtt_ns": host_mono_recv_ns - host_mono_ns,
-            }
+            return _anchor(body, time.monotonic_ns())
 
 
 def _host_bracket_anchor() -> dict:
     """Best-effort host-side-only clock anchor.
 
-    Used when the modem will not answer DIAG_VERNO_F at all (the LM960A18 /
-    SDX20 fire-and-forget firmware is the motivating case). It records host
+    Used when the modem will not answer DIAG_VERNO_F at all. The LM960A18 /
+    SDX20 was the motivating case, but it does answer: its reply was being
+    discarded in the pumped write. It records host
     time at the capture boundary rather than at a modem-acknowledged instant,
     so it is a **strictly coarser precision class**: the error is the modem's
     own buffering/queueing latency at that boundary, not half a round trip.
@@ -2701,6 +2746,45 @@ class _TolerantStream:
 
     def __getattr__(self, name):
         return getattr(self._stream, name)
+
+
+def _install_stop_handlers(handler) -> dict:
+    """Point SIGTERM, SIGINT and SIGHUP at ``handler`` and return the old ones.
+
+    SIGHUP is left alone when it is ignored, because a run under nohup ignores
+    it on purpose.
+    """
+    replaced = {}
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        if sig == signal.SIGHUP and signal.getsignal(sig) is signal.SIG_IGN:
+            continue
+        replaced[sig] = signal.signal(sig, handler)
+    return replaced
+
+
+def _hold_setup_stops(held: list):
+    """Signal handler for the arming window: record a stop, don't act on it.
+
+    From the first latching arm (the log mask) up to the read loop, diaggulp
+    is arming the modem and building the capture, and the disarming teardown
+    is a ``finally:`` that only starts at the read loop. A stop that raised in
+    this window skipped it and left the modem armed. A SIGTERM did worse: the
+    handlers were not installed yet, so its default action killed the process
+    outright. So a stop here is only recorded. The setup finishes (every step
+    is bounded), the read loop is skipped, and the teardown runs. That
+    matches the teardown shield: once a stop has arrived, only SIGKILL can cut
+    the disarms short.
+    """
+    def _hold(signum, frame):
+        held.append(signum)
+        if len(held) == 1:
+            try:
+                print("diaggulp: stop received while arming; finishing setup, then "
+                      "skipping the capture and running the teardown",
+                      file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass
+    return _hold
 
 
 def _shield_teardown(deferred: list) -> dict:
@@ -4149,8 +4233,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "backoff on a transport error or no reply, for up to SECONDS before "
              "the first real request (default 0 = off). For a capture started "
              "right after a modem (re)enumerates, where the tty exists before "
-             "the DIAG function answers. A modem that never answers "
-             "VERNO (LM960A18, telit-quirk path) cannot use it.",
+             "the DIAG function answers. This is a plain probe; the "
+             "LM960A18 is only known to answer VERNO over the telit-quirk "
+             "pumped path, so it may not work there.",
     )
     quirk_group = parser.add_mutually_exclusive_group()
     quirk_group.add_argument(
@@ -4186,7 +4271,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "before and after the capture and writes a "
              "<output>.anchors.json sidecar consumed by "
              "diaggrok_at_correlate.py --auto-align. A modem that never "
-             "answers DIAG_VERNO_F (e.g. the LM960A18 telit-quirk path) "
+             "answers DIAG_VERNO_F "
              "still gets a sidecar, with method=host_bracket — a coarser "
              "host-side boundary timestamp. 'none' disables anchor "
              "emission (original behavior) and leaves the capture with no "
@@ -4230,7 +4315,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--spc", default=None,
         help="Before the log-mask handshake, send a DIAG SPC unlock (opcode "
-             "0x46) in the SAME session. Use a literal 6-char code (e.g. "
+             "0x41) in the SAME session. Use a literal 6-char code (e.g. "
              "000000) or 'auto' to try known vendor SPCs (000000 then 0000). "
              "Needed on EG25/EC25-class (MDM9607) modems that reject "
              "LOG_CONFIG with DIAG_BAD_CMD_F until unlocked. Reachable "
@@ -4697,8 +4782,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         # 0x60 all answer a *plain* write+read on this same firmware.
 
     # --- SPC unlock: EG25/EC25 (MDM9607) gate LOG_CONFIG behind an SPC
-    # unlock (opcode 0x46) and reject the mask handshake with DIAG_BAD_CMD_F
-    # until unlocked. Must run before the handshake, on a writable command path
+    # unlock (DIAG_SPC_F 0x41; an earlier build sent 0x46, DIAG_PASSWORD_F) and
+    # reject the mask handshake with DIAG_BAD_CMD_F until unlocked. Must run before the handshake, on a writable command path
     # — so skip the passive consumers (tcp-connect/udp-listen own no
     # command channel).
     if args.spc:
@@ -4730,6 +4815,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
         )
 
+    # From the first latching arm until the read loop starts, a stop is held,
+    # not acted on, so that it still reaches the disarming teardown.
+    _setup_stops: list[int] = []
+    _handlers_before_setup = _install_stop_handlers(_hold_setup_stops(_setup_stops))
+
     # --- Send log mask config to enable all log codes ---
     # The handshake commonly times out on cold-boot / USB re-enumeration
     # while the modem is still settling. Retry once after a short
@@ -4745,6 +4835,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 narrow_codes = [int(c, 0) for c in args.log_code]
             except ValueError as exc:
                 print(f"error: invalid --log-code value ({exc})", file=sys.stderr)
+                for _sig, _handler in _handlers_before_setup.items():
+                    signal.signal(_sig, _handler)
                 return 2
         attempts = max(1, 1 + args.mask_retries)
         last_exc: Optional[RuntimeError] = None
@@ -4855,13 +4947,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     # catches KeyboardInterrupt, so the stop lands on the clean-exit path.
     def _sig_handler(signum, frame):
         raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, _sig_handler)
-    signal.signal(signal.SIGINT, _sig_handler)
-    # A dropped controlling shell (harness TaskStop) is a stop too, so it must
-    # reach the disarming teardown rather than kill outright. A run
-    # under nohup has SIGHUP ignored on purpose; leave that alone.
-    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
-        signal.signal(signal.SIGHUP, _sig_handler)
+    # These are installed at the top of the read loop's try:, not here. Until
+    # then the setup-window hold above stays in force. A dropped
+    # controlling shell (SIGHUP, a harness TaskStop) is a stop too, unless the
+    # run is under nohup.
 
     # --- Anchor-frame eligibility check ---
     # Anchors need a sidecar location, so stdout capture has none. A rotating
@@ -5072,7 +5161,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     stop_info: dict = {}   # records WHY the capture loop stopped
     _deferred_signals: list[int] = []   # signals that arrived during teardown
     try:
-        if writer is not None:
+        # Setup is over. From here a stop ends the read loop. Install
+        # first, then check, so no signal falls between the two.
+        _install_stop_handlers(_sig_handler)
+        if _setup_stops:
+            stop_info["reason"] = "signal"
+            bytes_written, elapsed = 0, 0.0
+            print(f"diaggulp: {len(_setup_stops)} stop signal(s) arrived while "
+                  "arming; no capture was taken, running the teardown",
+                  file=sys.stderr, flush=True)
+        elif writer is not None:
             # Rotating: must go through writer.write() so the rotation check
             # fires. A tested module-level function.
             bytes_written, elapsed = slurp_rotating(

@@ -169,7 +169,7 @@ class TestTelitVersionAnchor:
         return C()
 
     def test_returns_anchor_when_verno_reply_arrives(self, monkeypatch):
-        monkeypatch.setattr(diaggulp, "_telit_write_pumped", lambda *a, **k: None)
+        monkeypatch.setattr(diaggulp, "_telit_write_pumped", lambda *a, **k: [])
         client = self._client([(VERNO, b"M2000B")])
         got = diaggulp._telit_version_anchor(client, timeout=1.0)
         assert got is not None
@@ -180,7 +180,7 @@ class TestTelitVersionAnchor:
     def test_ignores_unrelated_frames_until_the_verno_reply(self, monkeypatch):
         """The kick loop's own LOG_CONFIG replies (and any log traffic) must
         not be mistaken for the anchor response."""
-        monkeypatch.setattr(diaggulp, "_telit_write_pumped", lambda *a, **k: None)
+        monkeypatch.setattr(diaggulp, "_telit_write_pumped", lambda *a, **k: [])
         client = self._client([
             (diaggulp._DIAG_LOG_CONFIG_F, b"\x00" * 8),
             (0x10, b"log"),
@@ -190,8 +190,19 @@ class TestTelitVersionAnchor:
         assert got is not None
         assert got["response_bytes_hex"] == b"OK".hex()
 
+    def test_returns_anchor_from_the_reply_drained_during_the_write(self, monkeypatch):
+        """The pumped write usually reads the VERNO reply itself: it
+        returns ``(opcode, body, recv_ns)`` frames, and the anchor uses them
+        without a further recv()."""
+        drained = [(diaggulp._DIAG_LOG_CONFIG_F, b"\x00" * 8, 5), (VERNO, b"OK", 7)]
+        monkeypatch.setattr(diaggulp, "_telit_write_pumped", lambda *a, **k: drained)
+        got = diaggulp._telit_version_anchor(self._client([]), timeout=0.2)
+        assert got is not None
+        assert got["response_bytes_hex"] == b"OK".hex()
+        assert got["host_mono_recv_ns"] == 7
+
     def test_returns_none_on_silence(self, monkeypatch):
-        monkeypatch.setattr(diaggulp, "_telit_write_pumped", lambda *a, **k: None)
+        monkeypatch.setattr(diaggulp, "_telit_write_pumped", lambda *a, **k: [])
         assert diaggulp._telit_version_anchor(
             self._client([]), timeout=0.2) is None
 

@@ -22,21 +22,20 @@ diaggulp is built to **compose** with them, not compete.
 
 ## Install
 
-diaggulp is not on PyPI; install it from GitHub at a release tag:
+From [PyPI](https://pypi.org/project/diaggulp/):
 
 ```
-pip install "diaggulp @ git+https://github.com/lukejenkins/diaggulp@v2026.10.31"
-pip install "diaggulp[serial] @ git+https://github.com/lukejenkins/diaggulp@v2026.10.31"   # + live USB-serial capture
-pip install "diaggulp[decode] @ git+https://github.com/lukejenkins/diaggulp@v2026.10.31"   # + --decode, --pcap-out, --pcap replay
+pip install diaggulp
+pip install "diaggulp[serial]"   # + live USB-serial capture
+pip install "diaggulp[decode]"   # + --decode, --pcap-out, --pcap replay
 ```
 
-The base install needs `diagmunge` (the DIAG transport) and `zstandard`; it
-pulls `diagmunge` at the tag it pins. The `serial` and `decode` extras add
-`pyserial` and `diaggrok`, imported only when used. `--pcap` replay of a
-capture file needs the `decode` extra, for diaggrok's HDLC framer. Install
-diaggulp on its own rather than in the same command as a different diagmunge
-or diaggrok reference: pip resolves git URLs by string, so two references to
-the same library conflict even when they name the same commit.
+The base install needs `diagmunge` (the DIAG transport) and `zstandard`, both
+pulled from PyPI. The `serial` and `decode` extras add `pyserial` and
+`diaggrok`, imported only when used. `--pcap` replay of a capture file needs
+the `decode` extra, for diaggrok's HDLC framer. Each PyPI version is the same
+code as the GitHub tag of the same number (`diaggulp==2026.11.8` is tag
+`v2026.11.8`).
 
 ## Usage
 
