@@ -46,8 +46,8 @@ diaggulp /dev/ttyUSB0 -o capture.dlf
 # Capture to stdout, to pipe into a downstream decoder
 diaggulp /dev/ttyUSB0 -o -
 
-# Capture over a network DIAG transport
-diaggulp tcp://192.168.1.1:43555 -o capture.dlf
+# Capture over the network from a device that listens for DIAG
+diaggulp --transport tcp-connect --host 192.168.1.1 --port 43555 -o capture.dlf
 
 # Capture raw DIAG and also write a live Wireshark pcap (needs the decode extra)
 diaggulp /dev/ttyUSB0 -o capture.dlf --pcap-out live.pcap
